@@ -80,6 +80,12 @@ enum Command {
 		#[arg(long, default_value = "../llm-baremetal")]
 		workspace: PathBuf,
 	},
+	HandoffCheck {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -335,6 +341,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		}
 		Command::SovereignStatus { workspace } => {
 			print_sovereign_status(&snapshot, &paths, &workspace)?
+		}
+		Command::HandoffCheck { workspace, export } => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			print_handoff_check(&snapshot, &workspace, &export_path)?
 		}
 	}
 
@@ -729,6 +739,74 @@ fn print_sovereign_status(
 	Ok(())
 }
 
+fn print_handoff_check(
+	snapshot: &Snapshot,
+	workspace: &Path,
+	export_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let export_json: serde_json::Value = read_json(export_path)?;
+	let issues = validate_handoff_export(&export_json);
+	let smoke_commands = read_smoke_commands(&workspace_root.join("llmk-autorun-handoff-smoke.txt"))?;
+	let smoke_missing = missing_smoke_commands(&smoke_commands);
+	let mode = export_json
+		.get("mode")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("<missing>");
+	let export_kind = export_json
+		.get("export_kind")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("<missing>");
+	let schema_version = export_json
+		.get("schema_version")
+		.and_then(serde_json::Value::as_u64)
+		.map(|v| v.to_string())
+		.unwrap_or_else(|| "<missing>".to_string());
+	let top_goal_count = export_json
+		.get("top_goals")
+		.and_then(serde_json::Value::as_array)
+		.map(|items| items.len())
+		.unwrap_or(0);
+	let recent_event_count = export_json
+		.get("recent_events")
+		.and_then(serde_json::Value::as_array)
+		.map(|items| items.len())
+		.unwrap_or(0);
+
+	println!("oo-bot handoff check");
+	println!("workspace             : {}", workspace_root.display());
+	println!("export_path           : {}", export_path.display());
+	println!("export_kind           : {}", export_kind);
+	println!("schema_version        : {}", schema_version);
+	println!("mode                  : {}", mode);
+	println!("top_goals             : {}", top_goal_count);
+	println!("recent_events         : {}", recent_event_count);
+	println!("continuity_context    : {}", continuity_summary(snapshot));
+	println!("export_validation     : {}", if issues.is_empty() { "ok" } else { "failed" });
+	println!("smoke_script_commands : {}", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
+
+	if !issues.is_empty() {
+		println!("export_issues:");
+		for issue in &issues {
+			println!("- {}", issue);
+		}
+	}
+
+	if !smoke_missing.is_empty() {
+		println!("smoke_missing:");
+		for cmd in &smoke_missing {
+			println!("- {}", cmd);
+		}
+	}
+
+	println!("recommendations:");
+	for item in recommend_handoff_actions(snapshot, &issues, &smoke_missing) {
+		println!("- {}", item);
+	}
+
+	Ok(())
+}
+
 fn generate_protection_keypair(snapshot: &Snapshot) -> ProtectionKeyPair {
 	let signing_key = SigningKey::generate(&mut OsRng);
 	let verifying_key = signing_key.verifying_key();
@@ -913,6 +991,135 @@ fn recommend_sovereign_actions(
 	}
 
 	out.truncate(6);
+	out
+}
+
+fn validate_handoff_export(export: &serde_json::Value) -> Vec<String> {
+	let mut issues = Vec::new();
+	let required = [
+		"schema_version",
+		"export_kind",
+		"generated_at_epoch_s",
+		"organism_id",
+		"genesis_id",
+		"runtime_habitat",
+		"runtime_instance_id",
+		"continuity_epoch",
+		"boot_or_start_count",
+		"mode",
+		"policy",
+		"active_goal_count",
+		"top_goals",
+		"recent_events",
+	];
+
+	for field in required {
+		if export.get(field).is_none() {
+			issues.push(format!("missing required field `{field}`"));
+		}
+	}
+
+	match export.get("schema_version").and_then(serde_json::Value::as_u64) {
+		Some(1) => {}
+		Some(other) => issues.push(format!("unsupported schema_version `{other}`")),
+		None => {}
+	}
+
+	match export.get("export_kind").and_then(serde_json::Value::as_str) {
+		Some("oo_sovereign_handoff") => {}
+		Some(other) => issues.push(format!("unexpected export_kind `{other}`")),
+		None => {}
+	}
+
+	match export.get("mode").and_then(serde_json::Value::as_str) {
+		Some("normal" | "degraded" | "safe") => {}
+		Some(other) => issues.push(format!("invalid mode `{other}`")),
+		None => {}
+	}
+
+	match export.get("policy") {
+		Some(policy) if policy.is_object() => {
+			match policy.get("enforcement").and_then(serde_json::Value::as_str) {
+				Some("off" | "observe" | "enforce") => {}
+				Some(other) => issues.push(format!("invalid policy.enforcement `{other}`")),
+				None => issues.push("missing required field `policy.enforcement`".to_string()),
+			}
+		}
+		Some(_) => issues.push("field `policy` must be an object".to_string()),
+		None => {}
+	}
+
+	if let Some(top_goals) = export.get("top_goals") {
+		if !top_goals.is_array() {
+			issues.push("field `top_goals` must be an array".to_string());
+		}
+	}
+
+	if let Some(recent_events) = export.get("recent_events") {
+		if !recent_events.is_array() {
+			issues.push("field `recent_events` must be an array".to_string());
+		}
+	}
+
+	issues
+}
+
+fn read_smoke_commands(path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+	if !path.exists() {
+		return Ok(Vec::new());
+	}
+
+	let file = File::open(path)?;
+	let reader = BufReader::new(file);
+	let mut commands = Vec::new();
+
+	for line in reader.lines() {
+		let line = line?;
+		let trimmed = line.trim();
+		if trimmed.is_empty() || trimmed.starts_with('#') {
+			continue;
+		}
+		commands.push(trimmed.to_string());
+	}
+
+	Ok(commands)
+}
+
+fn missing_smoke_commands(commands: &[String]) -> Vec<&'static str> {
+	let expected = [
+		"/oo_handoff_info",
+		"/oo_handoff_apply",
+		"/oo_handoff_receipt",
+		"/oo_continuity_status",
+	];
+
+	expected
+		.into_iter()
+		.filter(|cmd| !commands.iter().any(|item| item == cmd))
+		.collect()
+}
+
+fn recommend_handoff_actions(
+	snapshot: &Snapshot,
+	issues: &[String],
+	smoke_missing: &[&'static str],
+) -> Vec<String> {
+	let mut out = Vec::new();
+
+	if !issues.is_empty() {
+		out.push("Regenerate the host sovereign export after fixing the reported contract mismatches.".to_string());
+	}
+	if !smoke_missing.is_empty() {
+		out.push("Restore the missing handoff smoke commands before relying on the sovereign autorun validation path.".to_string());
+	}
+
+	for item in recommend_actions(snapshot) {
+		if !out.contains(&item) {
+			out.push(item);
+		}
+	}
+
+	out.truncate(5);
 	out
 }
 
