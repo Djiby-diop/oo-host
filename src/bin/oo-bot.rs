@@ -102,6 +102,17 @@ enum Command {
 		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
 		format: OutputFormat,
 	},
+	GithubSovereignIssue {
+		title: String,
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+		#[arg(long)]
+		focus: Option<String>,
+		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+		format: OutputFormat,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -393,6 +404,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		} => {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			print_github_sovereign_brief(&snapshot, &paths, &workspace, &export_path, format)?
+		}
+		Command::GithubSovereignIssue {
+			title,
+			workspace,
+			export,
+			focus,
+			format,
+		} => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			print_github_sovereign_issue(&snapshot, &paths, &title, &workspace, &export_path, focus.as_deref(), format)?
 		}
 	}
 
@@ -969,6 +990,80 @@ fn print_github_sovereign_brief(
 			println!("export_validation={} smoke_script={}", if data.export_validation_ok { "ok" } else { "failed" }, if data.smoke_ok { "ok" } else { "missing_entries" });
 			println!("mode={} policy={}", data.mode, data.policy);
 			println!("manifest={} attestation={}", present_absent(data.manifest_present), present_absent(data.attestation_present));
+			for action in data.actions {
+				println!("- {}", action);
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn print_github_sovereign_issue(
+	snapshot: &Snapshot,
+	paths: &AppPaths,
+	title: &str,
+	workspace: &Path,
+	export_path: &Path,
+	focus: Option<&str>,
+	format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let data = build_sovereign_brief_data(snapshot, paths, workspace, export_path)?;
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("# {}", title);
+			println!();
+			println!("## Context");
+			println!();
+			println!("- workspace: `{}`", data.workspace_root.display());
+			println!("- layout: `{}`", data.layout);
+			println!("- continuity: `{}`", data.continuity);
+			println!("- mode: `{}`", data.mode);
+			println!("- policy_enforcement: `{}`", data.policy);
+			println!("- export_validation: `{}`", if data.export_validation_ok { "ok" } else { "failed" });
+			println!("- smoke_script: `{}`", if data.smoke_ok { "ok" } else { "missing_entries" });
+			if let Some(focus) = focus {
+				println!("- requested_focus: `{}`", focus);
+			}
+			println!();
+			println!("## Readiness signals");
+			println!();
+			println!("- protection_manifest: `{}`", present_absent(data.manifest_present));
+			println!("- protection_attestation: `{}`", present_absent(data.attestation_present));
+			println!("- sovereign handoff contract: `{}`", if data.issues.is_empty() && data.smoke_missing.is_empty() { "ready" } else { "attention_required" });
+			println!();
+			if !data.issues.is_empty() {
+				println!("## Contract issues");
+				println!();
+				for issue in &data.issues {
+					println!("- {}", issue);
+				}
+				println!();
+			}
+			if !data.smoke_missing.is_empty() {
+				println!("## Missing smoke commands");
+				println!();
+				for cmd in &data.smoke_missing {
+					println!("- `{}`", cmd);
+				}
+				println!();
+			}
+			println!("## Suggested actions");
+			println!();
+			for action in data.actions {
+				println!("- [ ] {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("ISSUE: {}", title);
+			println!("workspace={}", data.workspace_root.display());
+			println!("layout={} continuity={}", data.layout, data.continuity);
+			println!("mode={} policy={}", data.mode, data.policy);
+			println!("export_validation={} smoke_script={}", if data.export_validation_ok { "ok" } else { "failed" }, if data.smoke_ok { "ok" } else { "missing_entries" });
+			if let Some(focus) = focus {
+				println!("focus={}", focus);
+			}
 			for action in data.actions {
 				println!("- {}", action);
 			}
