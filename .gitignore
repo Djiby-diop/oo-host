@@ -1,0 +1,8 @@
+target/
+data/*
+!data/.gitkeep
+
+# Local protection artifacts
+data/protection_ed25519_key.json
+data/code_protection_manifest.json
+data/code_protection_attestation.json

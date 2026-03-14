@@ -1,0 +1,989 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use clap::{Parser, Subcommand, ValueEnum};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Parser, Debug)]
+#[command(name = "oo-bot")]
+#[command(about = "Operator/assistant companion for oo-host")]
+struct Cli {
+	#[arg(long, default_value = "data")]
+	data_dir: PathBuf,
+
+	#[command(subcommand)]
+	command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+	Status,
+	Brief,
+	Next,
+	GithubBrief {
+		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+		format: OutputFormat,
+	},
+	GithubIssue {
+		title: String,
+		#[arg(long)]
+		focus: Option<String>,
+		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+		format: OutputFormat,
+	},
+	GithubPr {
+		title: String,
+		#[arg(long)]
+		head: Option<String>,
+		#[arg(long, default_value = "main")]
+		base: String,
+		#[arg(long)]
+		focus: Option<String>,
+		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+		format: OutputFormat,
+	},
+	ProtectManifest {
+		#[arg(long)]
+		workspace: PathBuf,
+		#[arg(long)]
+		out: Option<PathBuf>,
+	},
+	ProtectStatus {
+		#[arg(long)]
+		workspace: PathBuf,
+	},
+	ProtectVerify {
+		#[arg(long)]
+		workspace: PathBuf,
+		#[arg(long)]
+		manifest: PathBuf,
+	},
+	ProtectKeygen {
+		#[arg(long)]
+		out: Option<PathBuf>,
+	},
+	ProtectStamp {
+		#[arg(long)]
+		manifest: PathBuf,
+		#[arg(long)]
+		key: Option<PathBuf>,
+		#[arg(long)]
+		out: Option<PathBuf>,
+	},
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+	Markdown,
+	Text,
+}
+
+#[derive(Debug)]
+struct AppPaths {
+	identity_path: PathBuf,
+	state_path: PathBuf,
+	journal_path: PathBuf,
+	sovereign_export_path: PathBuf,
+}
+
+impl AppPaths {
+	fn new(root: PathBuf) -> Self {
+		Self {
+			identity_path: root.join("organism_identity.json"),
+			state_path: root.join("organism_state.json"),
+			journal_path: root.join("organism_journal.jsonl"),
+			sovereign_export_path: root.join("sovereign_export.json"),
+		}
+	}
+}
+
+#[derive(Debug, Deserialize)]
+struct Identity {
+	organism_id: String,
+	genesis_id: String,
+	runtime_habitat: String,
+	created_at_epoch_s: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeMode {
+	Normal,
+	Degraded,
+	Safe,
+}
+
+impl RuntimeMode {
+	fn as_str(&self) -> &'static str {
+		match self {
+			Self::Normal => "normal",
+			Self::Degraded => "degraded",
+			Self::Safe => "safe",
+		}
+	}
+
+	fn rank(&self) -> u8 {
+		match self {
+			Self::Normal => 0,
+			Self::Degraded => 1,
+			Self::Safe => 2,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PolicyEnforcement {
+	Off,
+	Observe,
+	Enforce,
+}
+
+impl PolicyEnforcement {
+	fn as_str(&self) -> &'static str {
+		match self {
+			Self::Off => "off",
+			Self::Observe => "observe",
+			Self::Enforce => "enforce",
+		}
+	}
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct PolicyState {
+	safe_first: bool,
+	deny_by_default: bool,
+	llm_advisory_only: bool,
+	enforcement: PolicyEnforcement,
+}
+
+#[derive(Debug, Deserialize)]
+struct Goal {
+	goal_id: String,
+	title: String,
+	status: String,
+	priority: i32,
+	created_at_epoch_s: u64,
+	updated_at_epoch_s: u64,
+	origin: String,
+	safety_class: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct State {
+	boot_or_start_count: u64,
+	continuity_epoch: u64,
+	last_clean_shutdown: bool,
+	last_recovery_reason: Option<String>,
+	last_started_at_epoch_s: u64,
+	mode: RuntimeMode,
+	policy: PolicyState,
+	goals: Vec<Goal>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct JournalEvent {
+	event_id: String,
+	ts_epoch_s: u64,
+	organism_id: String,
+	runtime_habitat: String,
+	runtime_instance_id: String,
+	kind: String,
+	severity: String,
+	summary: String,
+	reason: Option<String>,
+	action: Option<String>,
+	result: Option<String>,
+	continuity_epoch: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct SovereignExport {
+	schema_version: u32,
+	export_kind: String,
+	continuity_epoch: u64,
+	mode: String,
+	last_recovery_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct Snapshot {
+	identity: Identity,
+	state: State,
+	recent_events: Vec<JournalEvent>,
+	sovereign_export: Option<SovereignExport>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProtectionManifest {
+	schema_version: u32,
+	manifest_kind: String,
+	generated_at_epoch_s: u64,
+	organism_id: String,
+	runtime_habitat: String,
+	workspace_root: String,
+	file_count: usize,
+	entries: Vec<ProtectionEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProtectionEntry {
+	rel_path: String,
+	sha256: String,
+	bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProtectionKeyPair {
+	schema_version: u32,
+	key_kind: String,
+	created_at_epoch_s: u64,
+	organism_id: String,
+	public_key_base64: String,
+	secret_key_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProtectionAttestation {
+	schema_version: u32,
+	attestation_kind: &'static str,
+	sealed_at_epoch_s: u64,
+	organism_id: String,
+	runtime_habitat: String,
+	manifest_path: String,
+	manifest_sha256: String,
+	manifest_generated_at_epoch_s: u64,
+	workspace_root: String,
+	file_count: usize,
+	signature: Option<ProtectionSignature>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProtectionSignature {
+	algorithm: &'static str,
+	public_key_base64: String,
+	signature_base64: String,
+}
+
+#[derive(Debug)]
+struct ManifestDiff {
+	added: Vec<String>,
+	changed: Vec<String>,
+	removed: Vec<String>,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let cli = Cli::parse();
+	let paths = AppPaths::new(cli.data_dir);
+	let snapshot = load_snapshot(&paths)?;
+
+	match cli.command {
+		Command::Status => print_status(&snapshot),
+		Command::Brief => print_brief(&snapshot),
+		Command::Next => print_next_actions(&snapshot),
+		Command::GithubBrief { format } => print_github_brief(&snapshot, format),
+		Command::GithubIssue { title, focus, format } => {
+			print_github_issue(&snapshot, &title, focus.as_deref(), format)
+		}
+		Command::GithubPr {
+			title,
+			head,
+			base,
+			focus,
+			format,
+		} => print_github_pr(&snapshot, &title, head.as_deref(), &base, focus.as_deref(), format),
+		Command::ProtectManifest { workspace, out } => {
+			let out_path = out.unwrap_or_else(|| paths.identity_path.parent().unwrap_or(Path::new("data")).join("code_protection_manifest.json"));
+			let manifest = build_protection_manifest(&snapshot, &workspace)?;
+			write_json_pretty(&out_path, &manifest)?;
+			println!("OK: protection manifest written to {}", out_path.display());
+			println!("files_hashed: {}", manifest.file_count);
+		}
+		Command::ProtectStatus { workspace } => print_protection_status(&snapshot, &workspace)?,
+		Command::ProtectVerify { workspace, manifest } => {
+			print_protection_verify(&snapshot, &workspace, &manifest)?
+		}
+		Command::ProtectKeygen { out } => {
+			let out_path = out.unwrap_or_else(|| paths.identity_path.parent().unwrap_or(Path::new("data")).join("protection_ed25519_key.json"));
+			let keypair = generate_protection_keypair(&snapshot);
+			write_json_pretty(&out_path, &keypair)?;
+			println!("OK: protection signing key written to {}", out_path.display());
+			println!("public_key_base64: {}", keypair.public_key_base64);
+		}
+		Command::ProtectStamp { manifest, key, out } => {
+			let manifest_data: ProtectionManifest = read_json(&manifest)?;
+			let out_path = out.unwrap_or_else(|| paths.identity_path.parent().unwrap_or(Path::new("data")).join("code_protection_attestation.json"));
+			let attestation = build_protection_attestation(&snapshot, &manifest, &manifest_data, key.as_deref())?;
+			write_json_pretty(&out_path, &attestation)?;
+			println!("OK: protection attestation written to {}", out_path.display());
+			println!("manifest_sha256: {}", attestation.manifest_sha256);
+			println!("signed: {}", attestation.signature.is_some());
+		}
+	}
+
+	Ok(())
+}
+
+fn load_snapshot(paths: &AppPaths) -> Result<Snapshot, Box<dyn std::error::Error>> {
+	let identity: Identity = read_json(&paths.identity_path)?;
+	let state: State = read_json(&paths.state_path)?;
+	let recent_events = read_journal_tail(&paths.journal_path, 8)?;
+	let sovereign_export = if paths.sovereign_export_path.exists() {
+		Some(read_json(&paths.sovereign_export_path)?)
+	} else {
+		None
+	};
+
+	Ok(Snapshot {
+		identity,
+		state,
+		recent_events,
+		sovereign_export,
+	})
+}
+
+fn print_status(snapshot: &Snapshot) {
+	let active_goals = active_goals(&snapshot.state);
+	println!("oo-bot status");
+	println!("organism_id        : {}", snapshot.identity.organism_id);
+	println!("genesis_id         : {}", snapshot.identity.genesis_id);
+	println!("runtime_habitat    : {}", snapshot.identity.runtime_habitat);
+	println!("created_at_epoch_s : {}", snapshot.identity.created_at_epoch_s);
+	println!("mode               : {}", snapshot.state.mode.as_str());
+	println!("policy.enforcement : {}", snapshot.state.policy.enforcement.as_str());
+	println!("continuity_epoch   : {}", snapshot.state.continuity_epoch);
+	println!("boot_or_start_count: {}", snapshot.state.boot_or_start_count);
+	println!("last_clean_shutdown: {}", snapshot.state.last_clean_shutdown);
+	println!(
+		"last_recovery_reason: {}",
+		snapshot.state.last_recovery_reason.as_deref().unwrap_or("none")
+	);
+	println!("active_goals       : {}", active_goals.len());
+	println!("recent_events      : {}", snapshot.recent_events.len());
+	println!("sovereign_export   : {}", if snapshot.sovereign_export.is_some() { "present" } else { "absent" });
+}
+
+fn print_brief(snapshot: &Snapshot) {
+	let active_goals = active_goals(&snapshot.state);
+	let top_goals = top_goals(&active_goals, 3);
+	let continuity = continuity_summary(snapshot);
+
+	println!("OO Bot Brief");
+	println!("============");
+	println!(
+		"Habitat {} / mode {} / policy {} / continuity {}",
+		snapshot.identity.runtime_habitat,
+		snapshot.state.mode.as_str(),
+		snapshot.state.policy.enforcement.as_str(),
+		snapshot.state.continuity_epoch
+	);
+	println!("Continuity assessment: {}", continuity);
+	println!(
+		"Last recovery: {}",
+		snapshot.state.last_recovery_reason.as_deref().unwrap_or("none")
+	);
+	println!("Active goals: {}", active_goals.len());
+	for goal in top_goals {
+		println!(
+			"- [{}] {} (prio {}, safety {}, origin {})",
+			goal.status, goal.title, goal.priority, goal.safety_class, goal.origin
+		);
+	}
+
+	println!("Recent events:");
+	for ev in snapshot.recent_events.iter().rev().take(5).rev() {
+		println!(
+			"- {} [{}] {}",
+			ev.kind,
+			ev.severity,
+			ev.summary
+		);
+	}
+}
+
+fn print_next_actions(snapshot: &Snapshot) {
+	for (idx, action) in recommend_actions(snapshot).iter().enumerate() {
+		println!("{}. {}", idx + 1, action);
+	}
+}
+
+fn print_github_brief(snapshot: &Snapshot, format: OutputFormat) {
+	let actions = recommend_actions(snapshot);
+	let active_goals = active_goals(&snapshot.state);
+	let top_goals = top_goals(&active_goals, 3);
+	let continuity = continuity_summary(snapshot);
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("## OO Bot Brief");
+			println!();
+			println!("- organism: `{}`", snapshot.identity.organism_id);
+			println!("- habitat: `{}`", snapshot.identity.runtime_habitat);
+			println!("- mode: `{}`", snapshot.state.mode.as_str());
+			println!("- policy: `{}`", snapshot.state.policy.enforcement.as_str());
+			println!("- continuity_epoch: `{}`", snapshot.state.continuity_epoch);
+			println!("- continuity_assessment: `{}`", continuity);
+			println!();
+			println!("### Top goals");
+			for goal in top_goals {
+				println!(
+					"- `{}` — {} (prio {}, safety {})",
+					goal.goal_id, goal.title, goal.priority, goal.safety_class
+				);
+			}
+			println!();
+			println!("### Recent events");
+			for ev in snapshot.recent_events.iter().rev().take(5).rev() {
+				println!("- `{}` [{}] {}", ev.kind, ev.severity, ev.summary);
+			}
+			println!();
+			println!("### Suggested next actions");
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("OO Bot GitHub Brief");
+			println!("organism={} habitat={}", snapshot.identity.organism_id, snapshot.identity.runtime_habitat);
+			println!("mode={} policy={} continuity={}", snapshot.state.mode.as_str(), snapshot.state.policy.enforcement.as_str(), continuity);
+			println!("top_goals={}", active_goals.len());
+			for goal in top_goals {
+				println!("- {}", goal.title);
+			}
+			println!("next_actions:");
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
+	}
+}
+
+fn print_github_issue(snapshot: &Snapshot, title: &str, focus: Option<&str>, format: OutputFormat) {
+	let actions = recommend_actions(snapshot);
+	let continuity = continuity_summary(snapshot);
+	let active_goals = active_goals(&snapshot.state);
+	let top_goals = top_goals(&active_goals, 3);
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("# {}", title);
+			println!();
+			println!("## Context");
+			println!();
+			println!("- organism: `{}`", snapshot.identity.organism_id);
+			println!("- habitat: `{}`", snapshot.identity.runtime_habitat);
+			println!("- mode: `{}`", snapshot.state.mode.as_str());
+			println!("- policy: `{}`", snapshot.state.policy.enforcement.as_str());
+			println!("- continuity: `{}`", continuity);
+			if let Some(focus) = focus {
+				println!("- requested_focus: `{}`", focus);
+			}
+			println!();
+			println!("## Why");
+			println!();
+			println!("This issue was generated by `oo-bot` from the local organism state, active goals, and recent journal events.");
+			println!();
+			println!("## Signals");
+			for goal in top_goals {
+				println!("- active goal: `{}` — {} (prio {}, safety {})", goal.goal_id, goal.title, goal.priority, goal.safety_class);
+			}
+			for ev in snapshot.recent_events.iter().rev().take(5).rev() {
+				println!("- event: `{}` [{}] {}", ev.kind, ev.severity, ev.summary);
+			}
+			println!();
+			println!("## Suggested actions");
+			println!();
+			for action in actions {
+				println!("- [ ] {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("ISSUE: {}", title);
+			println!("continuity={} mode={} policy={}", continuity, snapshot.state.mode.as_str(), snapshot.state.policy.enforcement.as_str());
+			if let Some(focus) = focus {
+				println!("focus={}", focus);
+			}
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
+	}
+}
+
+fn print_github_pr(
+	snapshot: &Snapshot,
+	title: &str,
+	head: Option<&str>,
+	base: &str,
+	focus: Option<&str>,
+	format: OutputFormat,
+) {
+	let continuity = continuity_summary(snapshot);
+	let actions = recommend_actions(snapshot);
+	let active_goals = active_goals(&snapshot.state);
+	let top_goals = top_goals(&active_goals, 3);
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("# {}", title);
+			println!();
+			println!("## Summary");
+			println!();
+			println!("- generated by `oo-bot` from current host organism state");
+			println!("- continuity assessment at generation time: `{}`", continuity);
+			println!("- target base branch: `{}`", base);
+			if let Some(head) = head {
+				println!("- source head branch: `{}`", head);
+			}
+			if let Some(focus) = focus {
+				println!("- requested focus: `{}`", focus);
+			}
+			println!();
+			println!("## Organism context");
+			println!();
+			println!("- organism: `{}`", snapshot.identity.organism_id);
+			println!("- habitat: `{}`", snapshot.identity.runtime_habitat);
+			println!("- mode: `{}`", snapshot.state.mode.as_str());
+			println!("- policy: `{}`", snapshot.state.policy.enforcement.as_str());
+			println!("- continuity_epoch: `{}`", snapshot.state.continuity_epoch);
+			println!();
+			println!("## Top goals informing this PR");
+			println!();
+			for goal in top_goals {
+				println!("- `{}` — {} (prio {}, safety {})", goal.goal_id, goal.title, goal.priority, goal.safety_class);
+			}
+			println!();
+			println!("## Recent events");
+			println!();
+			for ev in snapshot.recent_events.iter().rev().take(5).rev() {
+				println!("- `{}` [{}] {}", ev.kind, ev.severity, ev.summary);
+			}
+			println!();
+			println!("## Suggested validation / follow-up");
+			println!();
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("PR: {}", title);
+			println!("base={} head={}", base, head.unwrap_or("(unspecified)"));
+			println!("continuity={} mode={} policy={}", continuity, snapshot.state.mode.as_str(), snapshot.state.policy.enforcement.as_str());
+			if let Some(focus) = focus {
+				println!("focus={}", focus);
+			}
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
+	}
+}
+
+fn build_protection_manifest(
+	snapshot: &Snapshot,
+	workspace: &Path,
+) -> Result<ProtectionManifest, Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let mut files = Vec::new();
+	collect_workspace_files(&workspace_root, &workspace_root, &mut files)?;
+	files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+	Ok(ProtectionManifest {
+		schema_version: 1,
+		manifest_kind: "oo_code_protection_manifest".to_string(),
+		generated_at_epoch_s: now_epoch_s(),
+		organism_id: snapshot.identity.organism_id.clone(),
+		runtime_habitat: snapshot.identity.runtime_habitat.clone(),
+		workspace_root: workspace_root.display().to_string(),
+		file_count: files.len(),
+		entries: files,
+	})
+}
+
+fn print_protection_status(
+	snapshot: &Snapshot,
+	workspace: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let manifest = build_protection_manifest(snapshot, &workspace_root)?;
+	let license_present = workspace_root.join("LICENSE").exists() || workspace_root.join("LICENSE.md").exists();
+	let readme_present = workspace_root.join("README.md").exists();
+
+	println!("oo-bot protection status");
+	println!("workspace           : {}", workspace_root.display());
+	println!("organism_id         : {}", snapshot.identity.organism_id);
+	println!("files_hashed        : {}", manifest.file_count);
+	println!("license_present     : {}", license_present);
+	println!("readme_present      : {}", readme_present);
+	println!("continuity_context  : {}", continuity_summary(snapshot));
+	println!("protection_scope    : provenance + hashing + manifest evidence");
+	println!("recommendations:");
+	println!("- regenerate the protection manifest after each validated merge or release");
+	println!("- keep repository license, authorship, and signed git history aligned");
+	println!("- store release manifests outside the repo as timestamped evidence");
+	println!("- enable GitHub branch protection and signed tags for official releases");
+	Ok(())
+}
+
+fn print_protection_verify(
+	snapshot: &Snapshot,
+	workspace: &Path,
+	manifest_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let saved_manifest: ProtectionManifest = read_json(manifest_path)?;
+	let current_manifest = build_protection_manifest(snapshot, workspace)?;
+	let diff = diff_manifests(&saved_manifest, &current_manifest);
+	let ok = diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty();
+
+	println!("oo-bot protection verify");
+	println!("workspace           : {}", current_manifest.workspace_root);
+	println!("manifest            : {}", manifest_path.display());
+	println!("saved_file_count    : {}", saved_manifest.file_count);
+	println!("current_file_count  : {}", current_manifest.file_count);
+	println!("added_files         : {}", diff.added.len());
+	println!("changed_files       : {}", diff.changed.len());
+	println!("removed_files       : {}", diff.removed.len());
+	println!("status              : {}", if ok { "match" } else { "drift_detected" });
+
+	if !diff.added.is_empty() {
+		println!("added:");
+		for path in diff.added.iter().take(10) {
+			println!("- {}", path);
+		}
+	}
+	if !diff.changed.is_empty() {
+		println!("changed:");
+		for path in diff.changed.iter().take(10) {
+			println!("- {}", path);
+		}
+	}
+	if !diff.removed.is_empty() {
+		println!("removed:");
+		for path in diff.removed.iter().take(10) {
+			println!("- {}", path);
+		}
+	}
+
+	Ok(())
+}
+
+fn generate_protection_keypair(snapshot: &Snapshot) -> ProtectionKeyPair {
+	let signing_key = SigningKey::generate(&mut OsRng);
+	let verifying_key = signing_key.verifying_key();
+
+	ProtectionKeyPair {
+		schema_version: 1,
+		key_kind: "oo_protection_ed25519_keypair".to_string(),
+		created_at_epoch_s: now_epoch_s(),
+		organism_id: snapshot.identity.organism_id.clone(),
+		public_key_base64: BASE64.encode(verifying_key.to_bytes()),
+		secret_key_base64: BASE64.encode(signing_key.to_bytes()),
+	}
+}
+
+fn build_protection_attestation(
+	snapshot: &Snapshot,
+	manifest_path: &Path,
+	manifest: &ProtectionManifest,
+	key_path: Option<&Path>,
+) -> Result<ProtectionAttestation, Box<dyn std::error::Error>> {
+	let manifest_sha256 = sha256_file_hex(manifest_path)?;
+	let mut attestation = ProtectionAttestation {
+		schema_version: 1,
+		attestation_kind: "oo_code_protection_attestation",
+		sealed_at_epoch_s: now_epoch_s(),
+		organism_id: snapshot.identity.organism_id.clone(),
+		runtime_habitat: snapshot.identity.runtime_habitat.clone(),
+		manifest_path: manifest_path.canonicalize().unwrap_or_else(|_| manifest_path.to_path_buf()).display().to_string(),
+		manifest_sha256,
+		manifest_generated_at_epoch_s: manifest.generated_at_epoch_s,
+		workspace_root: manifest.workspace_root.clone(),
+		file_count: manifest.file_count,
+		signature: None,
+	};
+
+	if let Some(key_path) = key_path {
+		let keypair: ProtectionKeyPair = read_json(key_path)?;
+		let signature = sign_attestation(&attestation, &keypair)?;
+		attestation.signature = Some(signature);
+	}
+
+	Ok(attestation)
+}
+
+fn sign_attestation(
+	attestation: &ProtectionAttestation,
+	keypair: &ProtectionKeyPair,
+) -> Result<ProtectionSignature, Box<dyn std::error::Error>> {
+	let secret_bytes = decode_fixed_32(&keypair.secret_key_base64, "secret key")?;
+	let public_bytes = decode_fixed_32(&keypair.public_key_base64, "public key")?;
+	let signing_key = SigningKey::from_bytes(&secret_bytes);
+	let verifying_key = VerifyingKey::from_bytes(&public_bytes)?;
+	let payload = serde_json::to_vec(attestation)?;
+	let signature = signing_key.sign(&payload);
+	verifying_key.verify(&payload, &signature)?;
+
+	Ok(ProtectionSignature {
+		algorithm: "ed25519",
+		public_key_base64: keypair.public_key_base64.clone(),
+		signature_base64: BASE64.encode(signature.to_bytes()),
+	})
+}
+
+fn diff_manifests(saved: &ProtectionManifest, current: &ProtectionManifest) -> ManifestDiff {
+	let saved_map = manifest_map(saved);
+	let current_map = manifest_map(current);
+	let mut added = Vec::new();
+	let mut changed = Vec::new();
+	let mut removed = Vec::new();
+
+	for (path, current_hash) in &current_map {
+		match saved_map.get(path) {
+			None => added.push(path.clone()),
+			Some(saved_hash) if saved_hash != current_hash => changed.push(path.clone()),
+			Some(_) => {}
+		}
+	}
+
+	for path in saved_map.keys() {
+		if !current_map.contains_key(path) {
+			removed.push(path.clone());
+		}
+	}
+
+	ManifestDiff { added, changed, removed }
+}
+
+fn manifest_map(manifest: &ProtectionManifest) -> BTreeMap<String, String> {
+	manifest
+		.entries
+		.iter()
+		.map(|entry| (entry.rel_path.clone(), entry.sha256.clone()))
+		.collect()
+}
+
+fn decode_fixed_32(value: &str, label: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	let bytes = BASE64.decode(value)?;
+	bytes
+		.try_into()
+		.map_err(|_| format!("invalid {label} length: expected 32 bytes").into())
+}
+
+fn continuity_summary(snapshot: &Snapshot) -> &'static str {
+	match &snapshot.sovereign_export {
+		None => "no_host_export",
+		Some(export) => {
+			if export.schema_version != 1 || export.export_kind != "oo_sovereign_handoff" {
+				return "invalid_host_export";
+			}
+			let local_epoch = snapshot.state.continuity_epoch;
+			if export.continuity_epoch > local_epoch {
+				"host_ahead"
+			} else if export.continuity_epoch < local_epoch {
+				"host_stale"
+			} else if mode_stricter_than(&snapshot.state.mode, &export.mode) {
+				"host_aligned_local_safer"
+			} else {
+				"aligned"
+			}
+		}
+	}
+}
+
+fn mode_stricter_than(local: &RuntimeMode, export_mode: &str) -> bool {
+	local.rank() > export_mode_rank(export_mode)
+}
+
+fn export_mode_rank(mode: &str) -> u8 {
+	match mode {
+		"normal" => 0,
+		"degraded" => 1,
+		"safe" => 2,
+		_ => 255,
+	}
+}
+
+fn recommend_actions(snapshot: &Snapshot) -> Vec<String> {
+	let mut out = Vec::new();
+
+	match continuity_summary(snapshot) {
+		"no_host_export" => out.push("Generate a fresh sovereign handoff export from oo-host before the next sovereign validation run.".to_string()),
+		"invalid_host_export" => out.push("Repair the host sovereign export format before using it for handoff-driven workflows.".to_string()),
+		"host_ahead" => out.push("Apply the newer host continuity state to sovereign runtime and re-run continuity diagnostics.".to_string()),
+		"host_stale" => out.push("Refresh the host export because sovereign continuity is ahead of the last recorded host handoff.".to_string()),
+		"host_aligned_local_safer" => out.push("Keep the sovereign posture: local runtime is already stricter than host continuity suggests.".to_string()),
+		_ => {}
+	}
+
+	if let Some(reason) = snapshot.state.last_recovery_reason.as_deref() {
+		out.push(format!("Investigate last recovery reason `{reason}` and capture a follow-up journal event or issue."));
+	}
+
+	if active_goals(&snapshot.state).is_empty() {
+		out.push("Create at least one active organism goal so the host runtime has a concrete next intent.".to_string());
+	} else {
+		let goals = active_goals(&snapshot.state);
+		let top = top_goals(&goals, 1);
+		if let Some(goal) = top.first() {
+			out.push(format!("Advance the top active goal `{}` and record progress in the journal.", goal.title));
+		}
+	}
+
+	if matches!(snapshot.state.policy.enforcement, PolicyEnforcement::Observe) {
+		out.push("Review whether host policy can graduate from observe to enforce without weakening sovereign invariants.".to_string());
+	}
+
+	if snapshot.recent_events.is_empty() {
+		out.push("Emit at least one journal event from oo-host to give the organism a causal trail.".to_string());
+	} else if let Some(last) = snapshot.recent_events.last() {
+		out.push(format!("Use the latest event `{}` as the basis for the next GitHub or engineering update.", last.kind));
+	}
+
+	out.truncate(5);
+	out
+}
+
+fn active_goals(state: &State) -> Vec<&Goal> {
+	state
+		.goals
+		.iter()
+		.filter(|g| g.status != "done" && g.status != "aborted")
+		.collect()
+}
+
+fn top_goals<'a>(goals: &'a [&'a Goal], count: usize) -> Vec<&'a Goal> {
+	let mut items = goals.to_vec();
+	items.sort_by(|a, b| {
+		b.priority
+			.cmp(&a.priority)
+			.then_with(|| b.updated_at_epoch_s.cmp(&a.updated_at_epoch_s))
+			.then_with(|| a.created_at_epoch_s.cmp(&b.created_at_epoch_s))
+	});
+	items.into_iter().take(count).collect()
+}
+
+fn read_journal_tail(path: &Path, count: usize) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+	if !path.exists() {
+		return Ok(Vec::new());
+	}
+
+	let file = File::open(path)?;
+	let reader = BufReader::new(file);
+	let mut events = Vec::new();
+
+	for line in reader.lines() {
+		let line = line?;
+		if line.trim().is_empty() {
+			continue;
+		}
+		let event: JournalEvent = serde_json::from_str(&line)?;
+		events.push(event);
+	}
+
+	if events.len() > count {
+		Ok(events.split_off(events.len() - count))
+	} else {
+		Ok(events)
+	}
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
+	let file = File::open(path)?;
+	Ok(serde_json::from_reader(file)?)
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error>> {
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)?;
+	}
+	let file = File::create(path)?;
+	serde_json::to_writer_pretty(file, value)?;
+	Ok(())
+}
+
+fn collect_workspace_files(
+	root: &Path,
+	current: &Path,
+	out: &mut Vec<ProtectionEntry>,
+) -> Result<(), Box<dyn std::error::Error>> {
+	for entry in fs::read_dir(current)? {
+		let entry = entry?;
+		let path = entry.path();
+		let file_type = entry.file_type()?;
+		let name = entry.file_name();
+		let name = name.to_string_lossy();
+
+		if file_type.is_dir() {
+			if should_skip_dir(&name) {
+				continue;
+			}
+			collect_workspace_files(root, &path, out)?;
+		} else if file_type.is_file() {
+			if !is_protected_source_file(&path, &name) {
+				continue;
+			}
+			let rel = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+			let meta = entry.metadata()?;
+			out.push(ProtectionEntry {
+				rel_path: rel,
+				sha256: sha256_file_hex(&path)?,
+				bytes: meta.len(),
+			});
+		}
+	}
+	Ok(())
+}
+
+fn should_skip_dir(name: &str) -> bool {
+	matches!(
+		name,
+		".git" | ".github" | ".venv" | "target" | "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache"
+	)
+}
+
+fn is_protected_source_file(path: &Path, name: &str) -> bool {
+	if name.eq_ignore_ascii_case("Makefile") || name.eq_ignore_ascii_case("LICENSE") || name.eq_ignore_ascii_case("README.md") {
+		return true;
+	}
+
+	match path.extension().and_then(|ext| ext.to_str()).map(|s| s.to_ascii_lowercase()) {
+		Some(ext) => matches!(
+			ext.as_str(),
+			"c" | "h" | "rs" | "toml" | "md" | "ps1" | "sh" | "yml" | "yaml" | "json" | "txt" | "py"
+		),
+		None => false,
+	}
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+	let mut file = File::open(path)?;
+	let mut hasher = Sha256::new();
+	let mut buf = [0u8; 8192];
+
+	loop {
+		let n = file.read(&mut buf)?;
+		if n == 0 {
+			break;
+		}
+		hasher.update(&buf[..n]);
+	}
+
+	Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn now_epoch_s() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0)
+}
