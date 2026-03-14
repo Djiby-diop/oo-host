@@ -94,6 +94,14 @@ enum Command {
 		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
 		format: OutputFormat,
 	},
+	GithubSovereignBrief {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+		format: OutputFormat,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -300,6 +308,22 @@ struct ManifestDiff {
 	removed: Vec<String>,
 }
 
+#[derive(Debug)]
+struct SovereignBriefData {
+	workspace_root: PathBuf,
+	layout: &'static str,
+	continuity: &'static str,
+	export_validation_ok: bool,
+	smoke_ok: bool,
+	mode: String,
+	policy: String,
+	manifest_present: bool,
+	attestation_present: bool,
+	issues: Vec<String>,
+	smoke_missing: Vec<&'static str>,
+	actions: Vec<String>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 	let paths = AppPaths::new(cli.data_dir);
@@ -361,6 +385,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		} => {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			print_sovereign_brief(&snapshot, &paths, &workspace, &export_path, format)?
+		}
+		Command::GithubSovereignBrief {
+			workspace,
+			export,
+			format,
+		} => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			print_github_sovereign_brief(&snapshot, &paths, &workspace, &export_path, format)?
 		}
 	}
 
@@ -830,6 +862,128 @@ fn print_sovereign_brief(
 	export_path: &Path,
 	format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+	let data = build_sovereign_brief_data(snapshot, paths, workspace, export_path)?;
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("## Sovereign Integration Brief");
+			println!();
+			println!("- workspace: `{}`", data.workspace_root.display());
+			println!("- layout: `{}`", data.layout);
+			println!("- continuity: `{}`", data.continuity);
+			println!("- export_validation: `{}`", if data.export_validation_ok { "ok" } else { "failed" });
+			println!("- smoke_script: `{}`", if data.smoke_ok { "ok" } else { "missing_entries" });
+			println!("- mode: `{}`", data.mode);
+			println!("- policy_enforcement: `{}`", data.policy);
+			println!("- protection_manifest: `{}`", present_absent(data.manifest_present));
+			println!("- protection_attestation: `{}`", present_absent(data.attestation_present));
+			println!();
+			if !data.issues.is_empty() {
+				println!("### Export issues");
+				for issue in &data.issues {
+					println!("- {}", issue);
+				}
+				println!();
+			}
+			if !data.smoke_missing.is_empty() {
+				println!("### Missing smoke commands");
+				for cmd in &data.smoke_missing {
+					println!("- `{}`", cmd);
+				}
+				println!();
+			}
+			println!("### Suggested next actions");
+			for action in data.actions {
+				println!("- {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("SOVEREIGN BRIEF");
+			println!("workspace={}", data.workspace_root.display());
+			println!("layout={} continuity={}", data.layout, data.continuity);
+			println!("export_validation={} smoke_script={}", if data.export_validation_ok { "ok" } else { "failed" }, if data.smoke_ok { "ok" } else { "missing_entries" });
+			println!("mode={} policy={}", data.mode, data.policy);
+			println!("protection_manifest={} protection_attestation={}", present_absent(data.manifest_present), present_absent(data.attestation_present));
+			for action in data.actions {
+				println!("- {}", action);
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn print_github_sovereign_brief(
+	snapshot: &Snapshot,
+	paths: &AppPaths,
+	workspace: &Path,
+	export_path: &Path,
+	format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let data = build_sovereign_brief_data(snapshot, paths, workspace, export_path)?;
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("## Sovereign GitHub Brief");
+			println!();
+			println!("- workspace: `{}`", data.workspace_root.display());
+			println!("- layout: `{}`", data.layout);
+			println!("- continuity: `{}`", data.continuity);
+			println!("- export_validation: `{}`", if data.export_validation_ok { "ok" } else { "failed" });
+			println!("- smoke_script: `{}`", if data.smoke_ok { "ok" } else { "missing_entries" });
+			println!("- mode: `{}`", data.mode);
+			println!("- policy_enforcement: `{}`", data.policy);
+			println!();
+			println!("### Readiness signals");
+			println!("- protection_manifest: `{}`", present_absent(data.manifest_present));
+			println!("- protection_attestation: `{}`", present_absent(data.attestation_present));
+			if data.issues.is_empty() && data.smoke_missing.is_empty() {
+				println!("- sovereign handoff contract: `ready`");
+			} else {
+				println!("- sovereign handoff contract: `attention_required`");
+			}
+			println!();
+			if !data.issues.is_empty() {
+				println!("### Contract issues");
+				for issue in &data.issues {
+					println!("- {}", issue);
+				}
+				println!();
+			}
+			if !data.smoke_missing.is_empty() {
+				println!("### Missing smoke commands");
+				for cmd in &data.smoke_missing {
+					println!("- `{}`", cmd);
+				}
+				println!();
+			}
+			println!("### Suggested next actions");
+			for action in data.actions {
+				println!("- [ ] {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("GITHUB SOVEREIGN BRIEF");
+			println!("workspace={}", data.workspace_root.display());
+			println!("layout={} continuity={}", data.layout, data.continuity);
+			println!("export_validation={} smoke_script={}", if data.export_validation_ok { "ok" } else { "failed" }, if data.smoke_ok { "ok" } else { "missing_entries" });
+			println!("mode={} policy={}", data.mode, data.policy);
+			println!("manifest={} attestation={}", present_absent(data.manifest_present), present_absent(data.attestation_present));
+			for action in data.actions {
+				println!("- {}", action);
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn build_sovereign_brief_data(
+	snapshot: &Snapshot,
+	paths: &AppPaths,
+	workspace: &Path,
+	export_path: &Path,
+) -> Result<SovereignBriefData, Box<dyn std::error::Error>> {
 	let workspace_root = workspace.canonicalize()?;
 	let export_json: serde_json::Value = read_json(export_path)?;
 	let issues = validate_handoff_export(&export_json);
@@ -857,61 +1011,30 @@ fn print_sovereign_brief(
 	let mode = export_json
 		.get("mode")
 		.and_then(serde_json::Value::as_str)
-		.unwrap_or("<missing>");
+		.unwrap_or("<missing>")
+		.to_string();
 	let policy = export_json
 		.get("policy")
 		.and_then(|v| v.get("enforcement"))
 		.and_then(serde_json::Value::as_str)
-		.unwrap_or("<missing>");
+		.unwrap_or("<missing>")
+		.to_string();
 	let actions = recommend_handoff_actions(snapshot, &issues, &smoke_missing);
 
-	match format {
-		OutputFormat::Markdown => {
-			println!("## Sovereign Integration Brief");
-			println!();
-			println!("- workspace: `{}`", workspace_root.display());
-			println!("- layout: `{}`", layout);
-			println!("- continuity: `{}`", continuity_summary(snapshot));
-			println!("- export_validation: `{}`", if issues.is_empty() { "ok" } else { "failed" });
-			println!("- smoke_script: `{}`", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
-			println!("- mode: `{}`", mode);
-			println!("- policy_enforcement: `{}`", policy);
-			println!("- protection_manifest: `{}`", present_absent(manifest_path.exists()));
-			println!("- protection_attestation: `{}`", present_absent(attestation_path.exists()));
-			println!();
-			if !issues.is_empty() {
-				println!("### Export issues");
-				for issue in &issues {
-					println!("- {}", issue);
-				}
-				println!();
-			}
-			if !smoke_missing.is_empty() {
-				println!("### Missing smoke commands");
-				for cmd in &smoke_missing {
-					println!("- `{}`", cmd);
-				}
-				println!();
-			}
-			println!("### Suggested next actions");
-			for action in actions {
-				println!("- {}", action);
-			}
-		}
-		OutputFormat::Text => {
-			println!("SOVEREIGN BRIEF");
-			println!("workspace={}", workspace_root.display());
-			println!("layout={} continuity={}", layout, continuity_summary(snapshot));
-			println!("export_validation={} smoke_script={}", if issues.is_empty() { "ok" } else { "failed" }, if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
-			println!("mode={} policy={}", mode, policy);
-			println!("protection_manifest={} protection_attestation={}", present_absent(manifest_path.exists()), present_absent(attestation_path.exists()));
-			for action in actions {
-				println!("- {}", action);
-			}
-		}
-	}
-
-	Ok(())
+	Ok(SovereignBriefData {
+		workspace_root,
+		layout,
+		continuity: continuity_summary(snapshot),
+		export_validation_ok: issues.is_empty(),
+		smoke_ok: smoke_missing.is_empty(),
+		mode,
+		policy,
+		manifest_present: manifest_path.exists(),
+		attestation_present: attestation_path.exists(),
+		issues,
+		smoke_missing,
+		actions,
+	})
 }
 
 fn generate_protection_keypair(snapshot: &Snapshot) -> ProtectionKeyPair {
