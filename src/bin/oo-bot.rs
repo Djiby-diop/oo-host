@@ -86,6 +86,14 @@ enum Command {
 		#[arg(long)]
 		export: Option<PathBuf>,
 	},
+	SovereignBrief {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+		#[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+		format: OutputFormat,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -345,6 +353,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		Command::HandoffCheck { workspace, export } => {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			print_handoff_check(&snapshot, &workspace, &export_path)?
+		}
+		Command::SovereignBrief {
+			workspace,
+			export,
+			format,
+		} => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			print_sovereign_brief(&snapshot, &paths, &workspace, &export_path, format)?
 		}
 	}
 
@@ -802,6 +818,97 @@ fn print_handoff_check(
 	println!("recommendations:");
 	for item in recommend_handoff_actions(snapshot, &issues, &smoke_missing) {
 		println!("- {}", item);
+	}
+
+	Ok(())
+}
+
+fn print_sovereign_brief(
+	snapshot: &Snapshot,
+	paths: &AppPaths,
+	workspace: &Path,
+	export_path: &Path,
+	format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let export_json: serde_json::Value = read_json(export_path)?;
+	let issues = validate_handoff_export(&export_json);
+	let smoke_commands = read_smoke_commands(&workspace_root.join("llmk-autorun-handoff-smoke.txt"))?;
+	let smoke_missing = missing_smoke_commands(&smoke_commands);
+	let host_root = paths
+		.identity_path
+		.parent()
+		.unwrap_or(Path::new("data"))
+		.canonicalize()
+		.ok()
+		.and_then(|p| p.parent().map(Path::to_path_buf))
+		.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+	let layout = layout_relationship(&host_root, &workspace_root);
+	let manifest_path = paths
+		.identity_path
+		.parent()
+		.unwrap_or(Path::new("data"))
+		.join("code_protection_manifest.json");
+	let attestation_path = paths
+		.identity_path
+		.parent()
+		.unwrap_or(Path::new("data"))
+		.join("code_protection_attestation.json");
+	let mode = export_json
+		.get("mode")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("<missing>");
+	let policy = export_json
+		.get("policy")
+		.and_then(|v| v.get("enforcement"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("<missing>");
+	let actions = recommend_handoff_actions(snapshot, &issues, &smoke_missing);
+
+	match format {
+		OutputFormat::Markdown => {
+			println!("## Sovereign Integration Brief");
+			println!();
+			println!("- workspace: `{}`", workspace_root.display());
+			println!("- layout: `{}`", layout);
+			println!("- continuity: `{}`", continuity_summary(snapshot));
+			println!("- export_validation: `{}`", if issues.is_empty() { "ok" } else { "failed" });
+			println!("- smoke_script: `{}`", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
+			println!("- mode: `{}`", mode);
+			println!("- policy_enforcement: `{}`", policy);
+			println!("- protection_manifest: `{}`", present_absent(manifest_path.exists()));
+			println!("- protection_attestation: `{}`", present_absent(attestation_path.exists()));
+			println!();
+			if !issues.is_empty() {
+				println!("### Export issues");
+				for issue in &issues {
+					println!("- {}", issue);
+				}
+				println!();
+			}
+			if !smoke_missing.is_empty() {
+				println!("### Missing smoke commands");
+				for cmd in &smoke_missing {
+					println!("- `{}`", cmd);
+				}
+				println!();
+			}
+			println!("### Suggested next actions");
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
+		OutputFormat::Text => {
+			println!("SOVEREIGN BRIEF");
+			println!("workspace={}", workspace_root.display());
+			println!("layout={} continuity={}", layout, continuity_summary(snapshot));
+			println!("export_validation={} smoke_script={}", if issues.is_empty() { "ok" } else { "failed" }, if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
+			println!("mode={} policy={}", mode, policy);
+			println!("protection_manifest={} protection_attestation={}", present_absent(manifest_path.exists()), present_absent(attestation_path.exists()));
+			for action in actions {
+				println!("- {}", action);
+			}
+		}
 	}
 
 	Ok(())
