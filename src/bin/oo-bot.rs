@@ -76,6 +76,10 @@ enum Command {
 		#[arg(long)]
 		out: Option<PathBuf>,
 	},
+	SovereignStatus {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -328,6 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			println!("OK: protection attestation written to {}", out_path.display());
 			println!("manifest_sha256: {}", attestation.manifest_sha256);
 			println!("signed: {}", attestation.signature.is_some());
+		}
+		Command::SovereignStatus { workspace } => {
+			print_sovereign_status(&snapshot, &paths, &workspace)?
 		}
 	}
 
@@ -677,6 +684,51 @@ fn print_protection_verify(
 	Ok(())
 }
 
+fn print_sovereign_status(
+	snapshot: &Snapshot,
+	paths: &AppPaths,
+	workspace: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let data_root = paths.identity_path.parent().unwrap_or(Path::new("data"));
+	let host_root = data_root
+		.canonicalize()
+		.ok()
+		.and_then(|p| p.parent().map(Path::to_path_buf))
+		.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+	let handoff_script = workspace_root.join("test-qemu-handoff.ps1");
+	let handoff_autorun = workspace_root.join("llmk-autorun-handoff-smoke.txt");
+	let sovereign_target = workspace_root.join("sovereign_export.json");
+	let readme_present = workspace_root.join("README.md").exists();
+	let license_present = workspace_root.join("LICENSE").exists() || workspace_root.join("LICENSE.md").exists();
+	let workspace_git = workspace_root.join(".git").exists();
+	let host_export_present = paths.sovereign_export_path.exists();
+	let manifest_path = data_root.join("code_protection_manifest.json");
+	let attestation_path = data_root.join("code_protection_attestation.json");
+	let layout = layout_relationship(&host_root, &workspace_root);
+
+	println!("oo-bot sovereign status");
+	println!("workspace             : {}", workspace_root.display());
+	println!("host_root             : {}", host_root.display());
+	println!("layout                : {}", layout);
+	println!("workspace_git         : {}", workspace_git);
+	println!("handoff_script        : {}", present_absent(handoff_script.exists()));
+	println!("handoff_autorun       : {}", present_absent(handoff_autorun.exists()));
+	println!("readme_present        : {}", readme_present);
+	println!("license_present       : {}", license_present);
+	println!("host_export           : {}", present_absent(host_export_present));
+	println!("sovereign_target      : {}", present_absent(sovereign_target.exists()));
+	println!("protection_manifest   : {}", present_absent(manifest_path.exists()));
+	println!("protection_attestation: {}", present_absent(attestation_path.exists()));
+	println!("continuity_context    : {}", continuity_summary(snapshot));
+	println!("recommendations:");
+	for action in recommend_sovereign_actions(snapshot, &workspace_root, paths, &host_root) {
+		println!("- {}", action);
+	}
+
+	Ok(())
+}
+
 fn generate_protection_keypair(snapshot: &Snapshot) -> ProtectionKeyPair {
 	let signing_key = SigningKey::generate(&mut OsRng);
 	let verifying_key = signing_key.verifying_key();
@@ -798,6 +850,70 @@ fn continuity_summary(snapshot: &Snapshot) -> &'static str {
 			}
 		}
 	}
+}
+
+fn layout_relationship(host_root: &Path, workspace_root: &Path) -> &'static str {
+	match (host_root.parent(), workspace_root.parent()) {
+		(Some(host_parent), Some(workspace_parent)) if host_parent == workspace_parent => "sibling",
+		_ => "custom",
+	}
+}
+
+fn present_absent(flag: bool) -> &'static str {
+	if flag {
+		"present"
+	} else {
+		"absent"
+	}
+}
+
+fn recommend_sovereign_actions(
+	snapshot: &Snapshot,
+	workspace_root: &Path,
+	paths: &AppPaths,
+	host_root: &Path,
+) -> Vec<String> {
+	let mut out = Vec::new();
+	let handoff_script = workspace_root.join("test-qemu-handoff.ps1");
+	let handoff_autorun = workspace_root.join("llmk-autorun-handoff-smoke.txt");
+	let manifest_path = paths
+		.identity_path
+		.parent()
+		.unwrap_or(Path::new("data"))
+		.join("code_protection_manifest.json");
+	let attestation_path = paths
+		.identity_path
+		.parent()
+		.unwrap_or(Path::new("data"))
+		.join("code_protection_attestation.json");
+
+	if !paths.sovereign_export_path.exists() {
+		out.push("Generate a fresh sovereign export from oo-host before the next handoff validation.".to_string());
+	}
+	if !handoff_script.exists() {
+		out.push("Restore or add `test-qemu-handoff.ps1` in the sovereign repo before running handoff smoke checks.".to_string());
+	}
+	if !handoff_autorun.exists() {
+		out.push("Restore `llmk-autorun-handoff-smoke.txt` so the handoff smoke can run deterministically.".to_string());
+	}
+	if layout_relationship(host_root, workspace_root) != "sibling" {
+		out.push("Use `-OoHostRoot` or `OO_HOST_ROOT` when the sovereign repo is not cloned beside oo-host.".to_string());
+	}
+	if !manifest_path.exists() {
+		out.push("Generate a protection manifest for the sovereign repo and keep it as release evidence.".to_string());
+	}
+	if manifest_path.exists() && !attestation_path.exists() {
+		out.push("Seal the current protection manifest with `protect-stamp` to produce timestamped evidence.".to_string());
+	}
+
+	for action in recommend_actions(snapshot) {
+		if !out.contains(&action) {
+			out.push(action);
+		}
+	}
+
+	out.truncate(6);
+	out
 }
 
 fn mode_stricter_than(local: &RuntimeMode, export_mode: &str) -> bool {

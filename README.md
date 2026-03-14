@@ -34,6 +34,7 @@ Examples:
 - `cargo run --bin oo-bot -- protect-verify --workspace ../llm-baremetal --manifest data/code_protection_manifest.json`
 - `cargo run --bin oo-bot -- protect-keygen`
 - `cargo run --bin oo-bot -- protect-stamp --manifest data/code_protection_manifest.json --key data/protection_ed25519_key.json`
+- `cargo run --bin oo-bot -- sovereign-status --workspace ../llm-baremetal`
 
 Current role:
 
@@ -43,6 +44,7 @@ Current role:
 - emit code-protection provenance manifests for the workspace
 - verify workspace drift against a saved protection manifest
 - generate timestamped protection attestations, optionally signed with an Ed25519 key
+- inspect sovereign workspace readiness and sibling-repo handoff posture
 - suggest the next engineering actions from goals, journal, and continuity posture
 
 Protection note:
