@@ -36,6 +36,7 @@ Examples:
 - `cargo run --bin oo-bot -- protect-stamp --manifest data/code_protection_manifest.json --key data/protection_ed25519_key.json`
 - `cargo run --bin oo-bot -- sovereign-status --workspace ../llm-baremetal`
 - `cargo run --bin oo-bot -- handoff-check --workspace ../llm-baremetal`
+- `cargo run --bin oo-bot -- handoff-status --workspace ../llm-baremetal`
 - `cargo run --bin oo-bot -- sovereign-brief --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-brief --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-issue "Sovereign integration follow-up" --workspace ../llm-baremetal --format markdown`
@@ -54,6 +55,7 @@ Current role:
 - generate timestamped protection attestations, optionally signed with an Ed25519 key
 - inspect sovereign workspace readiness and sibling-repo handoff posture
 - validate the current sovereign export contract and smoke-script readiness
+- emit a single operator status for the full handoff/sync loop
 - emit a concise sovereign integration brief for operator or GitHub use
 - emit a GitHub-ready sovereign report with checklist-style next actions
 - emit a GitHub-ready sovereign issue draft from current handoff state

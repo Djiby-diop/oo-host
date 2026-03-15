@@ -87,6 +87,14 @@ enum Command {
 		#[arg(long)]
 		export: Option<PathBuf>,
 	},
+	HandoffStatus {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+		#[arg(long)]
+		receipt: Option<PathBuf>,
+	},
 	SovereignBrief {
 		#[arg(long, default_value = "../llm-baremetal")]
 		workspace: PathBuf,
@@ -402,6 +410,21 @@ struct HandoffExportSummary {
 	issues: Vec<String>,
 }
 
+#[derive(Debug)]
+struct SyncCheckReport {
+	export_present: bool,
+	receipt_present: bool,
+	export_summary: Option<HandoffExportSummary>,
+	receipt: Option<HandoffReceipt>,
+	host_mode: String,
+	host_policy: String,
+	host_epoch: u64,
+	continuity_context: &'static str,
+	verdict: &'static str,
+	problems: Vec<String>,
+	warnings: Vec<String>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 	let paths = AppPaths::new(cli.data_dir);
@@ -455,6 +478,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		Command::HandoffCheck { workspace, export } => {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			print_handoff_check(&snapshot, &workspace, &export_path)?
+		}
+		Command::HandoffStatus {
+			workspace,
+			export,
+			receipt,
+		} => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
+			print_handoff_status(&snapshot, &workspace, &export_path, &receipt_path)?
 		}
 		Command::SovereignBrief {
 			workspace,
@@ -985,6 +1017,89 @@ fn print_handoff_check(
 	Ok(())
 }
 
+fn print_handoff_status(
+	snapshot: &Snapshot,
+	workspace: &Path,
+	export_path: &Path,
+	receipt_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let export_present = export_path.exists();
+	let export_json = if export_present {
+		Some(read_json::<serde_json::Value>(export_path)?)
+	} else {
+		None
+	};
+	let export_issues = export_json
+		.as_ref()
+		.map(validate_handoff_export)
+		.unwrap_or_else(|| vec![format!("missing export `{}`", export_path.display())]);
+	let smoke_commands = read_smoke_commands(&workspace_root.join("llmk-autorun-handoff-smoke.txt"))?;
+	let smoke_missing = missing_smoke_commands(&smoke_commands);
+	let sync = build_sync_check_report(snapshot, export_path, receipt_path)?;
+	let readiness = if export_present && export_issues.is_empty() && smoke_missing.is_empty() {
+		"ready"
+	} else {
+		"blocked"
+	};
+
+	println!("oo-bot handoff status");
+	println!("workspace             : {}", workspace_root.display());
+	println!("export_path           : {}", export_path.display());
+	println!("receipt_path          : {}", receipt_path.display());
+	println!("continuity_context    : {}", sync.continuity_context);
+	println!("handoff_readiness     : {}", readiness);
+	println!("export_validation     : {}", if export_issues.is_empty() { "ok" } else { "failed" });
+	println!("smoke_script_commands : {}", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
+	println!("sync_verdict          : {}", sync.verdict);
+	println!("host_mode             : {}", sync.host_mode);
+	println!("host_policy           : {}", sync.host_policy);
+	println!("host_epoch            : {}", sync.host_epoch);
+
+	if let Some(export) = &sync.export_summary {
+		println!("export_mode           : {}", export.mode);
+		println!("export_policy         : {}", export.policy_enforcement);
+		println!("export_epoch          : {}", export.continuity_epoch);
+	}
+	if let Some(receipt) = &sync.receipt {
+		println!("receipt_mode          : {}", receipt.mode);
+		println!("receipt_policy        : {}", receipt.policy_enforcement);
+		println!("receipt_epoch         : {}", receipt.continuity_epoch);
+	}
+
+	if !export_issues.is_empty() {
+		println!("export_issues:");
+		for issue in &export_issues {
+			println!("- {}", issue);
+		}
+	}
+	if !smoke_missing.is_empty() {
+		println!("smoke_missing:");
+		for cmd in &smoke_missing {
+			println!("- {}", cmd);
+		}
+	}
+	if !sync.problems.is_empty() {
+		println!("sync_problems:");
+		for item in &sync.problems {
+			println!("- {}", item);
+		}
+	}
+	if !sync.warnings.is_empty() {
+		println!("sync_warnings:");
+		for item in &sync.warnings {
+			println!("- {}", item);
+		}
+	}
+
+	println!("recommendations:");
+	for item in recommend_handoff_status_actions(readiness, &export_issues, &smoke_missing, &sync) {
+		println!("- {}", item);
+	}
+
+	Ok(())
+}
+
 fn print_sovereign_brief(
 	snapshot: &Snapshot,
 	paths: &AppPaths,
@@ -1187,6 +1302,57 @@ fn print_sync_check(
 	receipt_path: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
 	let workspace_root = workspace.canonicalize()?;
+	let report = build_sync_check_report(snapshot, export_path, receipt_path)?;
+
+	println!("oo-bot sync check");
+	println!("workspace             : {}", workspace_root.display());
+	println!("export_path           : {}", export_path.display());
+	println!("receipt_path          : {}", receipt_path.display());
+	println!("export_present        : {}", report.export_present);
+	println!("receipt_present       : {}", report.receipt_present);
+	println!("continuity_context    : {}", report.continuity_context);
+	println!("verdict               : {}", report.verdict);
+
+	if let Some(export) = &report.export_summary {
+		println!("host_export_epoch     : {}", export.continuity_epoch);
+		println!("host_export_mode      : {}", export.mode);
+		println!("host_export_policy    : {}", export.policy_enforcement);
+	}
+	if let Some(receipt) = &report.receipt {
+		println!("receipt_epoch         : {}", receipt.continuity_epoch);
+		println!("receipt_mode          : {}", receipt.mode);
+		println!("receipt_policy        : {}", receipt.policy_enforcement);
+	}
+	println!("host_epoch            : {}", report.host_epoch);
+	println!("host_mode             : {}", report.host_mode);
+	println!("host_policy           : {}", report.host_policy);
+
+	if !report.problems.is_empty() {
+		println!("problems:");
+		for item in &report.problems {
+			println!("- {}", item);
+		}
+	}
+	if !report.warnings.is_empty() {
+		println!("warnings:");
+		for item in &report.warnings {
+			println!("- {}", item);
+		}
+	}
+
+	println!("recommendations:");
+	for item in recommend_sync_actions(report.verdict, &report.problems, &report.warnings) {
+		println!("- {}", item);
+	}
+
+	Ok(report.verdict == "aligned")
+}
+
+fn build_sync_check_report(
+	snapshot: &Snapshot,
+	export_path: &Path,
+	receipt_path: &Path,
+) -> Result<SyncCheckReport, Box<dyn std::error::Error>> {
 	let export_present = export_path.exists();
 	let receipt_present = receipt_path.exists();
 	let export_summary = if export_present {
@@ -1200,8 +1366,8 @@ fn print_sync_check(
 		None
 	};
 
-	let host_mode = snapshot.state.mode.as_str();
-	let host_policy = snapshot.state.policy.enforcement.as_str();
+	let host_mode = snapshot.state.mode.as_str().to_string();
+	let host_policy = snapshot.state.policy.enforcement.as_str().to_string();
 	let host_epoch = snapshot.state.continuity_epoch;
 	let host_recovery = normalize_optional_text(snapshot.state.last_recovery_reason.as_deref());
 	let host_organism = snapshot.identity.organism_id.as_str();
@@ -1243,11 +1409,11 @@ fn print_sync_check(
 		}
 
 		if receipt.mode != host_mode {
-			let relation = compare_mode_relation(host_mode, &receipt.mode);
+			let relation = compare_mode_relation(&host_mode, &receipt.mode);
 			warnings.push(format!("receipt mode `{}` differs from host mode `{}` ({})", receipt.mode, host_mode, relation));
 		}
 		if receipt.policy_enforcement != host_policy {
-			let relation = compare_policy_relation(host_policy, &receipt.policy_enforcement);
+			let relation = compare_policy_relation(&host_policy, &receipt.policy_enforcement);
 			warnings.push(format!("receipt policy `{}` differs from host policy `{}` ({})", receipt.policy_enforcement, host_policy, relation));
 		}
 		if receipt.continuity_epoch != host_epoch {
@@ -1270,48 +1436,19 @@ fn print_sync_check(
 		}
 	};
 
-	println!("oo-bot sync check");
-	println!("workspace             : {}", workspace_root.display());
-	println!("export_path           : {}", export_path.display());
-	println!("receipt_path          : {}", receipt_path.display());
-	println!("export_present        : {}", export_present);
-	println!("receipt_present       : {}", receipt_present);
-	println!("continuity_context    : {}", continuity_summary(snapshot));
-	println!("verdict               : {}", verdict);
-
-	if let Some(export) = &export_summary {
-		println!("host_export_epoch     : {}", export.continuity_epoch);
-		println!("host_export_mode      : {}", export.mode);
-		println!("host_export_policy    : {}", export.policy_enforcement);
-	}
-	if let Some(receipt) = &receipt {
-		println!("receipt_epoch         : {}", receipt.continuity_epoch);
-		println!("receipt_mode          : {}", receipt.mode);
-		println!("receipt_policy        : {}", receipt.policy_enforcement);
-	}
-	println!("host_epoch            : {}", host_epoch);
-	println!("host_mode             : {}", host_mode);
-	println!("host_policy           : {}", host_policy);
-
-	if !problems.is_empty() {
-		println!("problems:");
-		for item in &problems {
-			println!("- {}", item);
-		}
-	}
-	if !warnings.is_empty() {
-		println!("warnings:");
-		for item in &warnings {
-			println!("- {}", item);
-		}
-	}
-
-	println!("recommendations:");
-	for item in recommend_sync_actions(verdict, &problems, &warnings) {
-		println!("- {}", item);
-	}
-
-	Ok(verdict == "aligned")
+	Ok(SyncCheckReport {
+		export_present,
+		receipt_present,
+		export_summary,
+		receipt,
+		host_mode,
+		host_policy,
+		host_epoch,
+		continuity_context: continuity_summary(snapshot),
+		verdict,
+		problems,
+		warnings,
+	})
 }
 
 fn read_handoff_export_summary(path: &Path) -> Result<HandoffExportSummary, Box<dyn std::error::Error>> {
@@ -1505,6 +1642,34 @@ fn recommend_sync_actions(verdict: &str, problems: &[String], warnings: &[String
 	}
 
 	out.truncate(5);
+	out
+}
+
+fn recommend_handoff_status_actions(
+	readiness: &str,
+	export_issues: &[String],
+	smoke_missing: &[&str],
+	sync: &SyncCheckReport,
+) -> Vec<String> {
+	let mut out = Vec::new();
+
+	if readiness != "ready" {
+		out.push("Repair the export contract and smoke-script prerequisites before treating the handoff loop as operator-ready.".to_string());
+	}
+	if !smoke_missing.is_empty() {
+		out.push("Restore the missing handoff autorun commands so sovereign smoke still covers info, apply, receipt, and continuity checks.".to_string());
+	}
+	if !export_issues.is_empty() {
+		out.push("Regenerate the sovereign export from oo-host before the next handoff validation cycle.".to_string());
+	}
+
+	for item in recommend_sync_actions(sync.verdict, &sync.problems, &sync.warnings) {
+		if !out.contains(&item) {
+			out.push(item);
+		}
+	}
+
+	out.truncate(6);
 	out
 }
 
