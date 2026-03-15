@@ -99,6 +99,16 @@ enum Command {
 		#[arg(long)]
 		out: Option<PathBuf>,
 	},
+	HandoffPack {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+		#[arg(long)]
+		receipt: Option<PathBuf>,
+		#[arg(long)]
+		out: Option<PathBuf>,
+	},
 	SovereignBrief {
 		#[arg(long, default_value = "../llm-baremetal")]
 		workspace: PathBuf,
@@ -493,6 +503,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
 			print_handoff_status(&snapshot, &workspace, &export_path, &receipt_path, format, out.as_deref())?
+		}
+		Command::HandoffPack {
+			workspace,
+			export,
+			receipt,
+			out,
+		} => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
+			let out_dir = out.unwrap_or_else(|| paths.identity_path.parent().unwrap_or(Path::new("data")).join("handoff-pack"));
+			write_handoff_pack(&snapshot, &paths, &workspace, &export_path, &receipt_path, &out_dir)?
 		}
 		Command::SovereignBrief {
 			workspace,
@@ -1276,49 +1297,75 @@ fn print_sync_check(
 ) -> Result<bool, Box<dyn std::error::Error>> {
 	let workspace_root = workspace.canonicalize()?;
 	let report = build_sync_check_report(snapshot, export_path, receipt_path)?;
-
-	println!("oo-bot sync check");
-	println!("workspace             : {}", workspace_root.display());
-	println!("export_path           : {}", export_path.display());
-	println!("receipt_path          : {}", receipt_path.display());
-	println!("export_present        : {}", report.export_present);
-	println!("receipt_present       : {}", report.receipt_present);
-	println!("continuity_context    : {}", report.continuity_context);
-	println!("verdict               : {}", report.verdict);
-
-	if let Some(export) = &report.export_summary {
-		println!("host_export_epoch     : {}", export.continuity_epoch);
-		println!("host_export_mode      : {}", export.mode);
-		println!("host_export_policy    : {}", export.policy_enforcement);
-	}
-	if let Some(receipt) = &report.receipt {
-		println!("receipt_epoch         : {}", receipt.continuity_epoch);
-		println!("receipt_mode          : {}", receipt.mode);
-		println!("receipt_policy        : {}", receipt.policy_enforcement);
-	}
-	println!("host_epoch            : {}", report.host_epoch);
-	println!("host_mode             : {}", report.host_mode);
-	println!("host_policy           : {}", report.host_policy);
-
-	if !report.problems.is_empty() {
-		println!("problems:");
-		for item in &report.problems {
-			println!("- {}", item);
-		}
-	}
-	if !report.warnings.is_empty() {
-		println!("warnings:");
-		for item in &report.warnings {
-			println!("- {}", item);
-		}
-	}
-
-	println!("recommendations:");
-	for item in recommend_sync_actions(report.verdict, &report.problems, &report.warnings) {
-		println!("- {}", item);
-	}
+	let rendered = render_sync_check(&workspace_root, export_path, receipt_path, &report, OutputFormat::Text);
+	print!("{}", rendered);
 
 	Ok(report.verdict == "aligned")
+}
+
+fn write_handoff_pack(
+	snapshot: &Snapshot,
+	paths: &AppPaths,
+	workspace: &Path,
+	export_path: &Path,
+	receipt_path: &Path,
+	out_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let sync = build_sync_check_report(snapshot, export_path, receipt_path)?;
+	let export_json = if export_path.exists() {
+		Some(read_json::<serde_json::Value>(export_path)?)
+	} else {
+		None
+	};
+	let export_issues = export_json
+		.as_ref()
+		.map(validate_handoff_export)
+		.unwrap_or_else(|| vec![format!("missing export `{}`", export_path.display())]);
+	let smoke_commands = read_smoke_commands(&workspace_root.join("llmk-autorun-handoff-smoke.txt"))?;
+	let smoke_missing = missing_smoke_commands(&smoke_commands);
+	let readiness = if export_path.exists() && export_issues.is_empty() && smoke_missing.is_empty() {
+		"ready"
+	} else {
+		"blocked"
+	};
+	let recommendations = recommend_handoff_status_actions(readiness, &export_issues, &smoke_missing, &sync);
+	let sovereign_brief = build_sovereign_brief_data(snapshot, paths, workspace, export_path)?;
+
+	fs::create_dir_all(out_dir)?;
+	let handoff_status_path = out_dir.join("handoff-status.md");
+	let sync_check_path = out_dir.join("sync-check.txt");
+	let sovereign_brief_path = out_dir.join("sovereign-brief.md");
+
+	write_text_file(
+		&handoff_status_path,
+		&render_handoff_status(
+			&workspace_root,
+			export_path,
+			receipt_path,
+			readiness,
+			&export_issues,
+			&smoke_missing,
+			&sync,
+			&recommendations,
+			OutputFormat::Markdown,
+		),
+	)?;
+	write_text_file(
+		&sync_check_path,
+		&render_sync_check(&workspace_root, export_path, receipt_path, &sync, OutputFormat::Text),
+	)?;
+	write_text_file(
+		&sovereign_brief_path,
+		&render_github_sovereign_brief(&sovereign_brief, OutputFormat::Markdown),
+	)?;
+
+	println!("OK: handoff pack written to {}", out_dir.display());
+	println!("- {}", handoff_status_path.display());
+	println!("- {}", sync_check_path.display());
+	println!("- {}", sovereign_brief_path.display());
+
+	Ok(())
 }
 
 fn build_sync_check_report(
@@ -1766,6 +1813,101 @@ fn render_handoff_status(
 			}
 			let _ = writeln!(out, "recommendations:");
 			for item in recommendations {
+				let _ = writeln!(out, "- {}", item);
+			}
+		}
+	}
+	out
+}
+
+fn render_sync_check(
+	workspace_root: &Path,
+	export_path: &Path,
+	receipt_path: &Path,
+	report: &SyncCheckReport,
+	format: OutputFormat,
+) -> String {
+	let mut out = String::new();
+	match format {
+		OutputFormat::Markdown => {
+			let _ = writeln!(out, "## Sync Check");
+			let _ = writeln!(out);
+			let _ = writeln!(out, "- workspace: `{}`", workspace_root.display());
+			let _ = writeln!(out, "- export_path: `{}`", export_path.display());
+			let _ = writeln!(out, "- receipt_path: `{}`", receipt_path.display());
+			let _ = writeln!(out, "- export_present: `{}`", report.export_present);
+			let _ = writeln!(out, "- receipt_present: `{}`", report.receipt_present);
+			let _ = writeln!(out, "- continuity_context: `{}`", report.continuity_context);
+			let _ = writeln!(out, "- verdict: `{}`", report.verdict);
+			if let Some(export) = &report.export_summary {
+				let _ = writeln!(out, "- host_export_epoch: `{}`", export.continuity_epoch);
+				let _ = writeln!(out, "- host_export_mode: `{}`", export.mode);
+				let _ = writeln!(out, "- host_export_policy: `{}`", export.policy_enforcement);
+			}
+			if let Some(receipt) = &report.receipt {
+				let _ = writeln!(out, "- receipt_epoch: `{}`", receipt.continuity_epoch);
+				let _ = writeln!(out, "- receipt_mode: `{}`", receipt.mode);
+				let _ = writeln!(out, "- receipt_policy: `{}`", receipt.policy_enforcement);
+			}
+			let _ = writeln!(out, "- host_epoch: `{}`", report.host_epoch);
+			let _ = writeln!(out, "- host_mode: `{}`", report.host_mode);
+			let _ = writeln!(out, "- host_policy: `{}`", report.host_policy);
+			let _ = writeln!(out);
+			if !report.problems.is_empty() {
+				let _ = writeln!(out, "### Problems");
+				for item in &report.problems {
+					let _ = writeln!(out, "- {}", item);
+				}
+				let _ = writeln!(out);
+			}
+			if !report.warnings.is_empty() {
+				let _ = writeln!(out, "### Warnings");
+				for item in &report.warnings {
+					let _ = writeln!(out, "- {}", item);
+				}
+				let _ = writeln!(out);
+			}
+			let _ = writeln!(out, "### Recommendations");
+			for item in recommend_sync_actions(report.verdict, &report.problems, &report.warnings) {
+				let _ = writeln!(out, "- {}", item);
+			}
+		}
+		OutputFormat::Text => {
+			let _ = writeln!(out, "oo-bot sync check");
+			let _ = writeln!(out, "workspace             : {}", workspace_root.display());
+			let _ = writeln!(out, "export_path           : {}", export_path.display());
+			let _ = writeln!(out, "receipt_path          : {}", receipt_path.display());
+			let _ = writeln!(out, "export_present        : {}", report.export_present);
+			let _ = writeln!(out, "receipt_present       : {}", report.receipt_present);
+			let _ = writeln!(out, "continuity_context    : {}", report.continuity_context);
+			let _ = writeln!(out, "verdict               : {}", report.verdict);
+			if let Some(export) = &report.export_summary {
+				let _ = writeln!(out, "host_export_epoch     : {}", export.continuity_epoch);
+				let _ = writeln!(out, "host_export_mode      : {}", export.mode);
+				let _ = writeln!(out, "host_export_policy    : {}", export.policy_enforcement);
+			}
+			if let Some(receipt) = &report.receipt {
+				let _ = writeln!(out, "receipt_epoch         : {}", receipt.continuity_epoch);
+				let _ = writeln!(out, "receipt_mode          : {}", receipt.mode);
+				let _ = writeln!(out, "receipt_policy        : {}", receipt.policy_enforcement);
+			}
+			let _ = writeln!(out, "host_epoch            : {}", report.host_epoch);
+			let _ = writeln!(out, "host_mode             : {}", report.host_mode);
+			let _ = writeln!(out, "host_policy           : {}", report.host_policy);
+			if !report.problems.is_empty() {
+				let _ = writeln!(out, "problems:");
+				for item in &report.problems {
+					let _ = writeln!(out, "- {}", item);
+				}
+			}
+			if !report.warnings.is_empty() {
+				let _ = writeln!(out, "warnings:");
+				for item in &report.warnings {
+					let _ = writeln!(out, "- {}", item);
+				}
+			}
+			let _ = writeln!(out, "recommendations:");
+			for item in recommend_sync_actions(report.verdict, &report.problems, &report.warnings) {
 				let _ = writeln!(out, "- {}", item);
 			}
 		}

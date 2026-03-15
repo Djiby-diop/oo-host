@@ -31,3 +31,102 @@ jobs:
 
       - name: Verify handoff-status help
         run: cargo run --quiet --bin oo-bot -- handoff-status --help > /dev/null
+
+  render-handoff-pack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout oo-host
+        uses: actions/checkout@v4
+
+      - name: Checkout llm-baremetal
+        uses: actions/checkout@v4
+        with:
+          repository: Djiby-diop/llm-baremetal
+          path: llm-baremetal
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Seed sample oo-host state
+        run: |
+          mkdir -p data
+          cat > data/organism_identity.json <<'EOF'
+          {
+            "organism_id": "ci-organism-001",
+            "genesis_id": "ci-genesis-001",
+            "runtime_habitat": "host_linux_ci",
+            "created_at_epoch_s": 1773441657
+          }
+          EOF
+          cat > data/organism_state.json <<'EOF'
+          {
+            "boot_or_start_count": 1,
+            "continuity_epoch": 0,
+            "last_clean_shutdown": true,
+            "last_recovery_reason": null,
+            "last_started_at_epoch_s": 1773441657,
+            "mode": "normal",
+            "policy": {
+              "safe_first": true,
+              "deny_by_default": true,
+              "llm_advisory_only": true,
+              "enforcement": "observe"
+            },
+            "goals": [
+              {
+                "goal_id": "ci-goal-001",
+                "title": "validate handoff pack",
+                "status": "in_progress",
+                "priority": 1,
+                "created_at_epoch_s": 1773441657,
+                "updated_at_epoch_s": 1773441657,
+                "origin": "ci",
+                "safety_class": "normal"
+              }
+            ]
+          }
+          EOF
+          cat > data/organism_journal.jsonl <<'EOF'
+          {"event_id":"ci-event-001","ts_epoch_s":1773441657,"organism_id":"ci-organism-001","runtime_habitat":"host_linux_ci","runtime_instance_id":"ci-instance-001","kind":"startup","severity":"info","summary":"ci bootstrap","reason":null,"action":"bootstrap","result":"ok","continuity_epoch":0}
+          EOF
+          cat > data/sovereign_export.json <<'EOF'
+          {
+            "schema_version": 1,
+            "export_kind": "oo_sovereign_handoff",
+            "organism_id": "ci-organism-001",
+            "continuity_epoch": 0,
+            "mode": "normal",
+            "last_recovery_reason": null,
+            "policy": {
+              "enforcement": "observe"
+            },
+            "top_goals": [
+              {"goal_id": "ci-goal-001", "title": "validate handoff pack"}
+            ],
+            "recent_events": [
+              {"kind": "startup", "severity": "info", "summary": "ci bootstrap"}
+            ],
+            "active_goal_count": 1
+          }
+          EOF
+
+      - name: Seed sample sovereign receipt
+        run: |
+          cat > llm-baremetal/OOHANDOFF.TXT <<'EOF'
+          organism_id=ci-organism-001
+          mode=normal
+          policy_enforcement=observe
+          continuity_epoch=0
+          last_recovery_reason=none
+          EOF
+
+      - name: Render handoff pack
+        run: |
+          cargo run --quiet --bin oo-bot -- --data-dir data handoff-pack --workspace llm-baremetal --out artifacts/handoff-pack
+
+      - name: Upload handoff artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: handoff-pack
+          path: artifacts/handoff-pack/
