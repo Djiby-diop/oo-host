@@ -153,6 +153,14 @@ enum Command {
 		#[arg(long)]
 		receipt: Option<PathBuf>,
 	},
+	SyncCheck {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		export: Option<PathBuf>,
+		#[arg(long)]
+		receipt: Option<PathBuf>,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -384,6 +392,16 @@ struct HandoffReceipt {
 	last_recovery_reason: Option<String>,
 }
 
+#[derive(Debug)]
+struct HandoffExportSummary {
+	organism_id: String,
+	mode: String,
+	policy_enforcement: String,
+	continuity_epoch: u64,
+	last_recovery_reason: Option<String>,
+	issues: Vec<String>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 	let paths = AppPaths::new(cli.data_dir);
@@ -493,6 +511,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		Command::ReceiptCheck { workspace, receipt } => {
 			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
 			print_receipt_check(&snapshot, &workspace, &receipt_path)?
+		}
+		Command::SyncCheck {
+			workspace,
+			export,
+			receipt,
+		} => {
+			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
+			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
+			let ok = print_sync_check(&snapshot, &workspace, &export_path, &receipt_path)?;
+			if !ok {
+				std::process::exit(2);
+			}
 		}
 	}
 
@@ -1150,6 +1180,178 @@ fn print_receipt_check(
 	Ok(())
 }
 
+fn print_sync_check(
+	snapshot: &Snapshot,
+	workspace: &Path,
+	export_path: &Path,
+	receipt_path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	let export_present = export_path.exists();
+	let receipt_present = receipt_path.exists();
+	let export_summary = if export_present {
+		Some(read_handoff_export_summary(export_path)?)
+	} else {
+		None
+	};
+	let receipt = if receipt_present {
+		Some(read_handoff_receipt(receipt_path)?)
+	} else {
+		None
+	};
+
+	let host_mode = snapshot.state.mode.as_str();
+	let host_policy = snapshot.state.policy.enforcement.as_str();
+	let host_epoch = snapshot.state.continuity_epoch;
+	let host_recovery = normalize_optional_text(snapshot.state.last_recovery_reason.as_deref());
+	let host_organism = snapshot.identity.organism_id.as_str();
+
+	let mut problems = Vec::new();
+	let mut warnings = Vec::new();
+	let verdict = if !export_present || !receipt_present {
+		if !export_present {
+			problems.push(format!("missing export `{}`", export_path.display()));
+		}
+		if !receipt_present {
+			problems.push(format!("missing receipt `{}`", receipt_path.display()));
+		}
+		"missing_artifact"
+	} else {
+		let export = export_summary.as_ref().expect("export summary present");
+		let receipt = receipt.as_ref().expect("receipt present");
+
+		if !export.issues.is_empty() {
+			for issue in &export.issues {
+				problems.push(format!("export: {}", issue));
+			}
+		}
+		if export.organism_id != host_organism {
+			problems.push("export organism_id does not match host organism_id".to_string());
+		}
+		if receipt.organism_id != host_organism {
+			problems.push("receipt organism_id does not match host organism_id".to_string());
+		}
+
+		if export.mode != host_mode {
+			warnings.push(format!("export mode `{}` differs from host mode `{}`", export.mode, host_mode));
+		}
+		if export.policy_enforcement != host_policy {
+			warnings.push(format!("export policy `{}` differs from host policy `{}`", export.policy_enforcement, host_policy));
+		}
+		if export.continuity_epoch != host_epoch {
+			warnings.push(format!("export continuity `{}` differs from host continuity `{}`", export.continuity_epoch, host_epoch));
+		}
+
+		if receipt.mode != host_mode {
+			let relation = compare_mode_relation(host_mode, &receipt.mode);
+			warnings.push(format!("receipt mode `{}` differs from host mode `{}` ({})", receipt.mode, host_mode, relation));
+		}
+		if receipt.policy_enforcement != host_policy {
+			let relation = compare_policy_relation(host_policy, &receipt.policy_enforcement);
+			warnings.push(format!("receipt policy `{}` differs from host policy `{}` ({})", receipt.policy_enforcement, host_policy, relation));
+		}
+		if receipt.continuity_epoch != host_epoch {
+			warnings.push(format!("receipt continuity `{}` differs from host continuity `{}` ({})", receipt.continuity_epoch, host_epoch, compare_epochs(host_epoch, receipt.continuity_epoch)));
+		}
+
+		if normalize_optional_text(export.last_recovery_reason.as_deref()) != host_recovery {
+			warnings.push("export last_recovery_reason differs from host state".to_string());
+		}
+		if normalize_optional_text(receipt.last_recovery_reason.as_deref()) != host_recovery {
+			warnings.push("receipt last_recovery_reason differs from host state".to_string());
+		}
+
+		if !problems.is_empty() {
+			"unsafe_mismatch"
+		} else if warnings.is_empty() {
+			"aligned"
+		} else {
+			"drift"
+		}
+	};
+
+	println!("oo-bot sync check");
+	println!("workspace             : {}", workspace_root.display());
+	println!("export_path           : {}", export_path.display());
+	println!("receipt_path          : {}", receipt_path.display());
+	println!("export_present        : {}", export_present);
+	println!("receipt_present       : {}", receipt_present);
+	println!("continuity_context    : {}", continuity_summary(snapshot));
+	println!("verdict               : {}", verdict);
+
+	if let Some(export) = &export_summary {
+		println!("host_export_epoch     : {}", export.continuity_epoch);
+		println!("host_export_mode      : {}", export.mode);
+		println!("host_export_policy    : {}", export.policy_enforcement);
+	}
+	if let Some(receipt) = &receipt {
+		println!("receipt_epoch         : {}", receipt.continuity_epoch);
+		println!("receipt_mode          : {}", receipt.mode);
+		println!("receipt_policy        : {}", receipt.policy_enforcement);
+	}
+	println!("host_epoch            : {}", host_epoch);
+	println!("host_mode             : {}", host_mode);
+	println!("host_policy           : {}", host_policy);
+
+	if !problems.is_empty() {
+		println!("problems:");
+		for item in &problems {
+			println!("- {}", item);
+		}
+	}
+	if !warnings.is_empty() {
+		println!("warnings:");
+		for item in &warnings {
+			println!("- {}", item);
+		}
+	}
+
+	println!("recommendations:");
+	for item in recommend_sync_actions(verdict, &problems, &warnings) {
+		println!("- {}", item);
+	}
+
+	Ok(verdict == "aligned")
+}
+
+fn read_handoff_export_summary(path: &Path) -> Result<HandoffExportSummary, Box<dyn std::error::Error>> {
+	let export_json: serde_json::Value = read_json(path)?;
+	let issues = validate_handoff_export(&export_json);
+	let organism_id = export_json
+		.get("organism_id")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("")
+		.to_string();
+	let mode = export_json
+		.get("mode")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("")
+		.to_string();
+	let policy_enforcement = export_json
+		.get("policy")
+		.and_then(|v| v.get("enforcement"))
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or("")
+		.to_string();
+	let continuity_epoch = export_json
+		.get("continuity_epoch")
+		.and_then(serde_json::Value::as_u64)
+		.unwrap_or(0);
+	let last_recovery_reason = export_json
+		.get("last_recovery_reason")
+		.and_then(serde_json::Value::as_str)
+		.and_then(normalize_optional_owned);
+
+	Ok(HandoffExportSummary {
+		organism_id,
+		mode,
+		policy_enforcement,
+		continuity_epoch,
+		last_recovery_reason,
+		issues,
+	})
+}
+
 fn read_handoff_receipt(path: &Path) -> Result<HandoffReceipt, Box<dyn std::error::Error>> {
 	let file = File::open(path)?;
 	let reader = BufReader::new(file);
@@ -1215,6 +1417,31 @@ fn compare_epochs(host_epoch: u64, receipt_epoch: u64) -> &'static str {
 	}
 }
 
+fn compare_mode_relation(host_mode: &str, receipt_mode: &str) -> &'static str {
+	match export_mode_rank(receipt_mode).cmp(&export_mode_rank(host_mode)) {
+		std::cmp::Ordering::Greater => "receipt_stricter",
+		std::cmp::Ordering::Less => "host_stricter",
+		std::cmp::Ordering::Equal => "aligned",
+	}
+}
+
+fn compare_policy_relation(host_policy: &str, receipt_policy: &str) -> &'static str {
+	match policy_rank(receipt_policy).cmp(&policy_rank(host_policy)) {
+		std::cmp::Ordering::Greater => "receipt_stricter",
+		std::cmp::Ordering::Less => "host_stricter",
+		std::cmp::Ordering::Equal => "aligned",
+	}
+}
+
+fn policy_rank(policy: &str) -> u8 {
+	match policy {
+		"off" => 0,
+		"observe" => 1,
+		"enforce" => 2,
+		_ => 255,
+	}
+}
+
 fn recommend_receipt_actions(
 	organism_match: bool,
 	mode_match: bool,
@@ -1243,6 +1470,38 @@ fn recommend_receipt_actions(
 	}
 	if out.is_empty() {
 		out.push("Receipt and host state are aligned; proceed with the next sovereign validation or operator update.".to_string());
+	}
+
+	out.truncate(5);
+	out
+}
+
+fn recommend_sync_actions(verdict: &str, problems: &[String], warnings: &[String]) -> Vec<String> {
+	let mut out = Vec::new();
+
+	match verdict {
+		"missing_artifact" => {
+			out.push("Generate the missing handoff artifact before relying on continuity synchronization.".to_string());
+		}
+		"unsafe_mismatch" => {
+			out.push("Stop the handoff loop and repair organism or export contract mismatches first.".to_string());
+		}
+		"drift" => {
+			out.push("Regenerate or reapply handoff state so host, export, and receipt converge again.".to_string());
+		}
+		_ => {
+			out.push("Host state, export, and receipt are aligned; proceed with the next validation step.".to_string());
+		}
+	}
+
+	if problems.iter().any(|p| p.contains("organism_id")) {
+		out.push("Verify both runtimes still belong to the same organism before applying any further handoff.".to_string());
+	}
+	if warnings.iter().any(|w| w.contains("continuity")) {
+		out.push("Run a fresh export and sovereign apply cycle if continuity drift should be closed now.".to_string());
+	}
+	if warnings.iter().any(|w| w.contains("mode") || w.contains("policy")) {
+		out.push("Review whether the sovereign side intentionally kept a stricter safety posture than the host.".to_string());
 	}
 
 	out.truncate(5);
