@@ -41,6 +41,7 @@ Examples:
 - `cargo run --bin oo-bot -- github-sovereign-issue "Sovereign integration follow-up" --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-pr "Sovereign integration update" --workspace ../llm-baremetal --head feature/x --base main --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-pack --workspace ../llm-baremetal --head feature/x --base main`
+- `cargo run --bin oo-bot -- receipt-check --workspace ../llm-baremetal`
 
 Current role:
 
@@ -57,6 +58,7 @@ Current role:
 - emit a GitHub-ready sovereign issue draft from current handoff state
 - emit a GitHub-ready sovereign PR draft from current handoff state
 - write a connected GitHub-ready sovereign pack to files for operator workflow
+- compare host state with the sovereign handoff receipt observed in `llm-baremetal`
 - suggest the next engineering actions from goals, journal, and continuity posture
 
 Protection note:

@@ -147,6 +147,12 @@ enum Command {
 		#[arg(long)]
 		out: Option<PathBuf>,
 	},
+	ReceiptCheck {
+		#[arg(long, default_value = "../llm-baremetal")]
+		workspace: PathBuf,
+		#[arg(long)]
+		receipt: Option<PathBuf>,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -369,6 +375,15 @@ struct SovereignBriefData {
 	actions: Vec<String>,
 }
 
+#[derive(Debug)]
+struct HandoffReceipt {
+	organism_id: String,
+	mode: String,
+	policy_enforcement: String,
+	continuity_epoch: u64,
+	last_recovery_reason: Option<String>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let cli = Cli::parse();
 	let paths = AppPaths::new(cli.data_dir);
@@ -474,6 +489,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			let out_dir = out.unwrap_or_else(|| paths.identity_path.parent().unwrap_or(Path::new("data")).join("github-sovereign"));
 			write_github_sovereign_pack(&snapshot, &paths, &workspace, &export_path, &issue_title, &pr_title, head.as_deref(), &base, focus.as_deref(), &out_dir)?
+		}
+		Command::ReceiptCheck { workspace, receipt } => {
+			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
+			print_receipt_check(&snapshot, &workspace, &receipt_path)?
 		}
 	}
 
@@ -1066,6 +1085,168 @@ fn write_github_sovereign_pack(
 	println!("- {}", issue_path.display());
 	println!("- {}", pr_path.display());
 	Ok(())
+}
+
+fn print_receipt_check(
+	snapshot: &Snapshot,
+	workspace: &Path,
+	receipt_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let workspace_root = workspace.canonicalize()?;
+	if !receipt_path.exists() {
+		println!("oo-bot receipt check");
+		println!("workspace             : {}", workspace_root.display());
+		println!("receipt_path          : {}", receipt_path.display());
+		println!("receipt_status        : absent");
+		println!("continuity_context    : {}", continuity_summary(snapshot));
+		println!("recommendations:");
+		println!("- Run the sovereign handoff apply path so `OOHANDOFF.TXT` is produced before comparing receipt state.");
+		println!("- Keep the host sovereign export current before the next handoff validation cycle.");
+		return Ok(());
+	}
+
+	let receipt = read_handoff_receipt(receipt_path)?;
+	let host_mode = snapshot.state.mode.as_str();
+	let host_policy = snapshot.state.policy.enforcement.as_str();
+	let host_epoch = snapshot.state.continuity_epoch;
+	let host_recovery = snapshot.state.last_recovery_reason.as_deref();
+	let receipt_recovery = normalize_optional_text(receipt.last_recovery_reason.as_deref());
+	let organism_match = receipt.organism_id == snapshot.identity.organism_id;
+	let mode_match = receipt.mode == host_mode;
+	let policy_match = receipt.policy_enforcement == host_policy;
+	let recovery_match = normalize_optional_text(host_recovery) == receipt_recovery;
+	let continuity_relation = compare_epochs(host_epoch, receipt.continuity_epoch);
+
+	println!("oo-bot receipt check");
+	println!("workspace             : {}", workspace_root.display());
+	println!("receipt_path          : {}", receipt_path.display());
+	println!("organism_match        : {}", organism_match);
+	println!("host_organism_id      : {}", snapshot.identity.organism_id);
+	println!("receipt_organism_id   : {}", receipt.organism_id);
+	println!("mode_match            : {}", mode_match);
+	println!("host_mode             : {}", host_mode);
+	println!("receipt_mode          : {}", receipt.mode);
+	println!("policy_match          : {}", policy_match);
+	println!("host_policy           : {}", host_policy);
+	println!("receipt_policy        : {}", receipt.policy_enforcement);
+	println!("continuity_relation   : {}", continuity_relation);
+	println!("host_continuity_epoch : {}", host_epoch);
+	println!("receipt_continuity    : {}", receipt.continuity_epoch);
+	println!("recovery_match        : {}", recovery_match);
+	println!("host_recovery         : {}", host_recovery.unwrap_or("none"));
+	println!("receipt_recovery      : {}", receipt_recovery.unwrap_or("none"));
+	println!("continuity_context    : {}", continuity_summary(snapshot));
+	println!("recommendations:");
+	for item in recommend_receipt_actions(
+		organism_match,
+		mode_match,
+		policy_match,
+		continuity_relation,
+		recovery_match,
+	) {
+		println!("- {}", item);
+	}
+
+	Ok(())
+}
+
+fn read_handoff_receipt(path: &Path) -> Result<HandoffReceipt, Box<dyn std::error::Error>> {
+	let file = File::open(path)?;
+	let reader = BufReader::new(file);
+	let mut organism_id = None;
+	let mut mode = None;
+	let mut policy_enforcement = None;
+	let mut continuity_epoch = None;
+	let mut last_recovery_reason = None;
+
+	for line in reader.lines() {
+		let line = line?;
+		let trimmed = line.trim();
+		if trimmed.is_empty() {
+			continue;
+		}
+		let Some((key, value)) = trimmed.split_once('=') else {
+			continue;
+		};
+		match key.trim() {
+			"organism_id" => organism_id = Some(value.trim().to_string()),
+			"mode" => mode = Some(value.trim().to_string()),
+			"policy_enforcement" => policy_enforcement = Some(value.trim().to_string()),
+			"continuity_epoch" => continuity_epoch = value.trim().parse::<u64>().ok(),
+			"last_recovery_reason" => {
+				last_recovery_reason = normalize_optional_owned(value.trim());
+			}
+			_ => {}
+		}
+	}
+
+	Ok(HandoffReceipt {
+		organism_id: organism_id.ok_or("missing organism_id in handoff receipt")?,
+		mode: mode.ok_or("missing mode in handoff receipt")?,
+		policy_enforcement: policy_enforcement.ok_or("missing policy_enforcement in handoff receipt")?,
+		continuity_epoch: continuity_epoch.ok_or("missing continuity_epoch in handoff receipt")?,
+		last_recovery_reason,
+	})
+}
+
+fn normalize_optional_owned(value: &str) -> Option<String> {
+	let trimmed = value.trim();
+	if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("null") {
+		None
+	} else {
+		Some(trimmed.to_string())
+	}
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<&str> {
+	match value {
+		Some(text) if !text.trim().is_empty() && !text.eq_ignore_ascii_case("none") && !text.eq_ignore_ascii_case("null") => Some(text),
+		_ => None,
+	}
+}
+
+fn compare_epochs(host_epoch: u64, receipt_epoch: u64) -> &'static str {
+	if host_epoch == receipt_epoch {
+		"aligned"
+	} else if host_epoch > receipt_epoch {
+		"host_ahead"
+	} else {
+		"sovereign_ahead"
+	}
+}
+
+fn recommend_receipt_actions(
+	organism_match: bool,
+	mode_match: bool,
+	policy_match: bool,
+	continuity_relation: &str,
+	recovery_match: bool,
+) -> Vec<String> {
+	let mut out = Vec::new();
+
+	if !organism_match {
+		out.push("Stop handoff use until host and sovereign organism identifiers match again.".to_string());
+	}
+	if !mode_match {
+		out.push("Review whether host mode or sovereign receipt mode changed after the last handoff application.".to_string());
+	}
+	if !policy_match {
+		out.push("Reconcile host policy enforcement with the sovereign receipt before the next validation run.".to_string());
+	}
+	match continuity_relation {
+		"host_ahead" => out.push("Apply or replay the latest host handoff so the sovereign receipt catches up.".to_string()),
+		"sovereign_ahead" => out.push("Inspect whether sovereign runtime advanced continuity beyond the last exported host state.".to_string()),
+		_ => {}
+	}
+	if !recovery_match {
+		out.push("Capture the recovery-reason divergence in the journal before the next handoff cycle.".to_string());
+	}
+	if out.is_empty() {
+		out.push("Receipt and host state are aligned; proceed with the next sovereign validation or operator update.".to_string());
+	}
+
+	out.truncate(5);
+	out
 }
 
 fn render_github_sovereign_brief(data: &SovereignBriefData, format: OutputFormat) -> String {
