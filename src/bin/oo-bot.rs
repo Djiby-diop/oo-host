@@ -96,6 +96,8 @@ enum Command {
 		receipt: Option<PathBuf>,
 		#[arg(long, value_enum, default_value_t = OutputFormat::Text)]
 		format: OutputFormat,
+		#[arg(long)]
+		out: Option<PathBuf>,
 	},
 	SovereignBrief {
 		#[arg(long, default_value = "../llm-baremetal")]
@@ -486,10 +488,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			export,
 			receipt,
 			format,
+			out,
 		} => {
 			let export_path = export.unwrap_or_else(|| paths.sovereign_export_path.clone());
 			let receipt_path = receipt.unwrap_or_else(|| workspace.join("OOHANDOFF.TXT"));
-			print_handoff_status(&snapshot, &workspace, &export_path, &receipt_path, format)?
+			print_handoff_status(&snapshot, &workspace, &export_path, &receipt_path, format, out.as_deref())?
 		}
 		Command::SovereignBrief {
 			workspace,
@@ -1026,6 +1029,7 @@ fn print_handoff_status(
 	export_path: &Path,
 	receipt_path: &Path,
 	format: OutputFormat,
+	out: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	let workspace_root = workspace.canonicalize()?;
 	let export_present = export_path.exists();
@@ -1047,121 +1051,23 @@ fn print_handoff_status(
 		"blocked"
 	};
 	let recommendations = recommend_handoff_status_actions(readiness, &export_issues, &smoke_missing, &sync);
+	let rendered = render_handoff_status(
+		&workspace_root,
+		export_path,
+		receipt_path,
+		readiness,
+		&export_issues,
+		&smoke_missing,
+		&sync,
+		&recommendations,
+		format,
+	);
 
-	match format {
-		OutputFormat::Markdown => {
-			println!("## Handoff Status");
-			println!();
-			println!("- workspace: `{}`", workspace_root.display());
-			println!("- export_path: `{}`", export_path.display());
-			println!("- receipt_path: `{}`", receipt_path.display());
-			println!("- continuity_context: `{}`", sync.continuity_context);
-			println!("- handoff_readiness: `{}`", readiness);
-			println!("- export_validation: `{}`", if export_issues.is_empty() { "ok" } else { "failed" });
-			println!("- smoke_script_commands: `{}`", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
-			println!("- sync_verdict: `{}`", sync.verdict);
-			println!("- host_mode: `{}`", sync.host_mode);
-			println!("- host_policy: `{}`", sync.host_policy);
-			println!("- host_epoch: `{}`", sync.host_epoch);
-			if let Some(export) = &sync.export_summary {
-				println!("- export_mode: `{}`", export.mode);
-				println!("- export_policy: `{}`", export.policy_enforcement);
-				println!("- export_epoch: `{}`", export.continuity_epoch);
-			}
-			if let Some(receipt) = &sync.receipt {
-				println!("- receipt_mode: `{}`", receipt.mode);
-				println!("- receipt_policy: `{}`", receipt.policy_enforcement);
-				println!("- receipt_epoch: `{}`", receipt.continuity_epoch);
-			}
-			println!();
-			if !export_issues.is_empty() {
-				println!("### Export issues");
-				for issue in &export_issues {
-					println!("- {}", issue);
-				}
-				println!();
-			}
-			if !smoke_missing.is_empty() {
-				println!("### Missing smoke commands");
-				for cmd in &smoke_missing {
-					println!("- `{}`", cmd);
-				}
-				println!();
-			}
-			if !sync.problems.is_empty() {
-				println!("### Sync problems");
-				for item in &sync.problems {
-					println!("- {}", item);
-				}
-				println!();
-			}
-			if !sync.warnings.is_empty() {
-				println!("### Sync warnings");
-				for item in &sync.warnings {
-					println!("- {}", item);
-				}
-				println!();
-			}
-			println!("### Recommendations");
-			for item in &recommendations {
-				println!("- {}", item);
-			}
-		}
-		OutputFormat::Text => {
-			println!("oo-bot handoff status");
-			println!("workspace             : {}", workspace_root.display());
-			println!("export_path           : {}", export_path.display());
-			println!("receipt_path          : {}", receipt_path.display());
-			println!("continuity_context    : {}", sync.continuity_context);
-			println!("handoff_readiness     : {}", readiness);
-			println!("export_validation     : {}", if export_issues.is_empty() { "ok" } else { "failed" });
-			println!("smoke_script_commands : {}", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
-			println!("sync_verdict          : {}", sync.verdict);
-			println!("host_mode             : {}", sync.host_mode);
-			println!("host_policy           : {}", sync.host_policy);
-			println!("host_epoch            : {}", sync.host_epoch);
-
-			if let Some(export) = &sync.export_summary {
-				println!("export_mode           : {}", export.mode);
-				println!("export_policy         : {}", export.policy_enforcement);
-				println!("export_epoch          : {}", export.continuity_epoch);
-			}
-			if let Some(receipt) = &sync.receipt {
-				println!("receipt_mode          : {}", receipt.mode);
-				println!("receipt_policy        : {}", receipt.policy_enforcement);
-				println!("receipt_epoch         : {}", receipt.continuity_epoch);
-			}
-
-			if !export_issues.is_empty() {
-				println!("export_issues:");
-				for issue in &export_issues {
-					println!("- {}", issue);
-				}
-			}
-			if !smoke_missing.is_empty() {
-				println!("smoke_missing:");
-				for cmd in &smoke_missing {
-					println!("- {}", cmd);
-				}
-			}
-			if !sync.problems.is_empty() {
-				println!("sync_problems:");
-				for item in &sync.problems {
-					println!("- {}", item);
-				}
-			}
-			if !sync.warnings.is_empty() {
-				println!("sync_warnings:");
-				for item in &sync.warnings {
-					println!("- {}", item);
-				}
-			}
-
-			println!("recommendations:");
-			for item in &recommendations {
-				println!("- {}", item);
-			}
-		}
+	if let Some(out_path) = out {
+		write_text_file(out_path, &rendered)?;
+		println!("OK: handoff status written to {}", out_path.display());
+	} else {
+		print!("{}", rendered);
 	}
 
 	Ok(())
@@ -1737,6 +1643,133 @@ fn recommend_handoff_status_actions(
 	}
 
 	out.truncate(6);
+	out
+}
+
+fn render_handoff_status(
+	workspace_root: &Path,
+	export_path: &Path,
+	receipt_path: &Path,
+	readiness: &str,
+	export_issues: &[String],
+	smoke_missing: &[&str],
+	sync: &SyncCheckReport,
+	recommendations: &[String],
+	format: OutputFormat,
+) -> String {
+	let mut out = String::new();
+	match format {
+		OutputFormat::Markdown => {
+			let _ = writeln!(out, "## Handoff Status");
+			let _ = writeln!(out);
+			let _ = writeln!(out, "- workspace: `{}`", workspace_root.display());
+			let _ = writeln!(out, "- export_path: `{}`", export_path.display());
+			let _ = writeln!(out, "- receipt_path: `{}`", receipt_path.display());
+			let _ = writeln!(out, "- continuity_context: `{}`", sync.continuity_context);
+			let _ = writeln!(out, "- handoff_readiness: `{}`", readiness);
+			let _ = writeln!(out, "- export_validation: `{}`", if export_issues.is_empty() { "ok" } else { "failed" });
+			let _ = writeln!(out, "- smoke_script_commands: `{}`", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
+			let _ = writeln!(out, "- sync_verdict: `{}`", sync.verdict);
+			let _ = writeln!(out, "- host_mode: `{}`", sync.host_mode);
+			let _ = writeln!(out, "- host_policy: `{}`", sync.host_policy);
+			let _ = writeln!(out, "- host_epoch: `{}`", sync.host_epoch);
+			if let Some(export) = &sync.export_summary {
+				let _ = writeln!(out, "- export_mode: `{}`", export.mode);
+				let _ = writeln!(out, "- export_policy: `{}`", export.policy_enforcement);
+				let _ = writeln!(out, "- export_epoch: `{}`", export.continuity_epoch);
+			}
+			if let Some(receipt) = &sync.receipt {
+				let _ = writeln!(out, "- receipt_mode: `{}`", receipt.mode);
+				let _ = writeln!(out, "- receipt_policy: `{}`", receipt.policy_enforcement);
+				let _ = writeln!(out, "- receipt_epoch: `{}`", receipt.continuity_epoch);
+			}
+			let _ = writeln!(out);
+			if !export_issues.is_empty() {
+				let _ = writeln!(out, "### Export issues");
+				for issue in export_issues {
+					let _ = writeln!(out, "- {}", issue);
+				}
+				let _ = writeln!(out);
+			}
+			if !smoke_missing.is_empty() {
+				let _ = writeln!(out, "### Missing smoke commands");
+				for cmd in smoke_missing {
+					let _ = writeln!(out, "- `{}`", cmd);
+				}
+				let _ = writeln!(out);
+			}
+			if !sync.problems.is_empty() {
+				let _ = writeln!(out, "### Sync problems");
+				for item in &sync.problems {
+					let _ = writeln!(out, "- {}", item);
+				}
+				let _ = writeln!(out);
+			}
+			if !sync.warnings.is_empty() {
+				let _ = writeln!(out, "### Sync warnings");
+				for item in &sync.warnings {
+					let _ = writeln!(out, "- {}", item);
+				}
+				let _ = writeln!(out);
+			}
+			let _ = writeln!(out, "### Recommendations");
+			for item in recommendations {
+				let _ = writeln!(out, "- {}", item);
+			}
+		}
+		OutputFormat::Text => {
+			let _ = writeln!(out, "oo-bot handoff status");
+			let _ = writeln!(out, "workspace             : {}", workspace_root.display());
+			let _ = writeln!(out, "export_path           : {}", export_path.display());
+			let _ = writeln!(out, "receipt_path          : {}", receipt_path.display());
+			let _ = writeln!(out, "continuity_context    : {}", sync.continuity_context);
+			let _ = writeln!(out, "handoff_readiness     : {}", readiness);
+			let _ = writeln!(out, "export_validation     : {}", if export_issues.is_empty() { "ok" } else { "failed" });
+			let _ = writeln!(out, "smoke_script_commands : {}", if smoke_missing.is_empty() { "ok" } else { "missing_entries" });
+			let _ = writeln!(out, "sync_verdict          : {}", sync.verdict);
+			let _ = writeln!(out, "host_mode             : {}", sync.host_mode);
+			let _ = writeln!(out, "host_policy           : {}", sync.host_policy);
+			let _ = writeln!(out, "host_epoch            : {}", sync.host_epoch);
+			if let Some(export) = &sync.export_summary {
+				let _ = writeln!(out, "export_mode           : {}", export.mode);
+				let _ = writeln!(out, "export_policy         : {}", export.policy_enforcement);
+				let _ = writeln!(out, "export_epoch          : {}", export.continuity_epoch);
+			}
+			if let Some(receipt) = &sync.receipt {
+				let _ = writeln!(out, "receipt_mode          : {}", receipt.mode);
+				let _ = writeln!(out, "receipt_policy        : {}", receipt.policy_enforcement);
+				let _ = writeln!(out, "receipt_epoch         : {}", receipt.continuity_epoch);
+			}
+			if !export_issues.is_empty() {
+				let _ = writeln!(out, "export_issues:");
+				for issue in export_issues {
+					let _ = writeln!(out, "- {}", issue);
+				}
+			}
+			if !smoke_missing.is_empty() {
+				let _ = writeln!(out, "smoke_missing:");
+				for cmd in smoke_missing {
+					let _ = writeln!(out, "- {}", cmd);
+				}
+			}
+			if !sync.problems.is_empty() {
+				let _ = writeln!(out, "sync_problems:");
+				for item in &sync.problems {
+					let _ = writeln!(out, "- {}", item);
+				}
+			}
+			if !sync.warnings.is_empty() {
+				let _ = writeln!(out, "sync_warnings:");
+				for item in &sync.warnings {
+					let _ = writeln!(out, "- {}", item);
+				}
+			}
+			let _ = writeln!(out, "recommendations:");
+			for item in recommendations {
+				let _ = writeln!(out, "- {}", item);
+			}
+		}
+	}
 	out
 }
 

@@ -38,6 +38,7 @@ Examples:
 - `cargo run --bin oo-bot -- handoff-check --workspace ../llm-baremetal`
 - `cargo run --bin oo-bot -- handoff-status --workspace ../llm-baremetal`
 - `cargo run --bin oo-bot -- handoff-status --workspace ../llm-baremetal --format markdown`
+- `cargo run --bin oo-bot -- handoff-status --workspace ../llm-baremetal --format markdown --out data/handoff-status.md`
 - `cargo run --bin oo-bot -- sovereign-brief --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-brief --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-issue "Sovereign integration follow-up" --workspace ../llm-baremetal --format markdown`

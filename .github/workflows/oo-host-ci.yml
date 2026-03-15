@@ -1,0 +1,33 @@
+name: oo-host CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check
+        run: cargo check --all-targets
+
+      - name: Build binaries
+        run: cargo build --bins
+
+      - name: Verify oo-bot help
+        run: cargo run --quiet --bin oo-bot -- --help > /dev/null
+
+      - name: Verify handoff-status help
+        run: cargo run --quiet --bin oo-bot -- handoff-status --help > /dev/null
