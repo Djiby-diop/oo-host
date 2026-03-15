@@ -23,6 +23,9 @@ jobs:
       - name: Cargo check
         run: cargo check --all-targets
 
+      - name: Cargo test
+        run: cargo test --all-targets
+
       - name: Build binaries
         run: cargo build --bins
 
@@ -124,6 +127,14 @@ jobs:
       - name: Render handoff pack
         run: |
           cargo run --quiet --bin oo-bot -- --data-dir data handoff-pack --workspace llm-baremetal --out artifacts/handoff-pack
+
+      - name: Verify rendered files
+        run: |
+          test -f artifacts/handoff-pack/handoff-status.md
+          test -f artifacts/handoff-pack/sync-check.txt
+          test -f artifacts/handoff-pack/sovereign-brief.md
+          grep -q "## Handoff Status" artifacts/handoff-pack/handoff-status.md
+          grep -q "verdict               : aligned" artifacts/handoff-pack/sync-check.txt
 
       - name: Upload handoff artifact
         uses: actions/upload-artifact@v4

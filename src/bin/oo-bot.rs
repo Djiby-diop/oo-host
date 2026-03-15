@@ -2665,3 +2665,178 @@ fn now_epoch_s() -> u64 {
 		.map(|d| d.as_secs())
 		.unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::fs;
+	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+	fn temp_root(label: &str) -> PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
+		let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+		let root = std::env::temp_dir().join(format!("oo-host-{label}-{nanos}-{id}"));
+		fs::create_dir_all(&root).expect("temp root");
+		root
+	}
+
+	fn sample_snapshot() -> Snapshot {
+		Snapshot {
+			identity: Identity {
+				organism_id: "test-organism-001".to_string(),
+				genesis_id: "test-genesis-001".to_string(),
+				runtime_habitat: "host_test".to_string(),
+				created_at_epoch_s: 1,
+			},
+			state: State {
+				boot_or_start_count: 1,
+				continuity_epoch: 0,
+				last_clean_shutdown: true,
+				last_recovery_reason: None,
+				last_started_at_epoch_s: 2,
+				mode: RuntimeMode::Normal,
+				policy: PolicyState {
+					safe_first: true,
+					deny_by_default: true,
+					llm_advisory_only: true,
+					enforcement: PolicyEnforcement::Observe,
+				},
+				goals: vec![Goal {
+					goal_id: "goal-001".to_string(),
+					title: "validate handoff pack".to_string(),
+					status: "in_progress".to_string(),
+					priority: 1,
+					created_at_epoch_s: 2,
+					updated_at_epoch_s: 2,
+					origin: "test".to_string(),
+					safety_class: "normal".to_string(),
+				}],
+			},
+			recent_events: vec![JournalEvent {
+				event_id: "event-001".to_string(),
+				ts_epoch_s: 2,
+				organism_id: "test-organism-001".to_string(),
+				runtime_habitat: "host_test".to_string(),
+				runtime_instance_id: "instance-001".to_string(),
+				kind: "startup".to_string(),
+				severity: "info".to_string(),
+				summary: "test bootstrap".to_string(),
+				reason: None,
+				action: Some("bootstrap".to_string()),
+				result: Some("ok".to_string()),
+				continuity_epoch: 0,
+			}],
+			sovereign_export: None,
+		}
+	}
+
+	fn seed_workspace(root: &Path) -> (AppPaths, PathBuf, PathBuf, PathBuf) {
+		let data_dir = root.join("data");
+		let workspace_dir = root.join("llm-baremetal");
+		fs::create_dir_all(&data_dir).expect("data dir");
+		fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+		let export_path = data_dir.join("sovereign_export.json");
+		let receipt_path = workspace_dir.join("OOHANDOFF.TXT");
+		let autorun_path = workspace_dir.join("llmk-autorun-handoff-smoke.txt");
+
+		write_text_file(
+			&autorun_path,
+			"/oo_handoff_info\n/oo_handoff_apply\n/oo_handoff_receipt\n/oo_continuity_status\n",
+		)
+		.expect("autorun");
+		write_text_file(
+			&receipt_path,
+			"organism_id=test-organism-001\nmode=normal\npolicy_enforcement=observe\ncontinuity_epoch=0\nlast_recovery_reason=none\n",
+		)
+		.expect("receipt");
+		write_text_file(
+			&export_path,
+			r#"{
+			  "schema_version": 1,
+			  "export_kind": "oo_sovereign_handoff",
+			  "generated_at_epoch_s": 2,
+			  "organism_id": "test-organism-001",
+			  "genesis_id": "test-genesis-001",
+			  "runtime_habitat": "host_test",
+			  "runtime_instance_id": "instance-001",
+			  "continuity_epoch": 0,
+			  "boot_or_start_count": 1,
+			  "mode": "normal",
+			  "last_recovery_reason": null,
+			  "policy": { "enforcement": "observe" },
+			  "top_goals": [{ "goal_id": "goal-001", "title": "validate handoff pack" }],
+			  "recent_events": [{ "kind": "startup", "severity": "info", "summary": "test bootstrap" }],
+			  "active_goal_count": 1
+			}"#,
+		)
+		.expect("export");
+
+		(AppPaths::new(data_dir), workspace_dir, export_path, receipt_path)
+	}
+
+	#[test]
+	fn render_sync_check_markdown_reports_aligned_state() {
+		let root = temp_root("sync-render");
+		let snapshot = sample_snapshot();
+		let (_paths, workspace_dir, export_path, receipt_path) = seed_workspace(&root);
+		let report = build_sync_check_report(&snapshot, &export_path, &receipt_path).expect("sync report");
+		let rendered = render_sync_check(&workspace_dir, &export_path, &receipt_path, &report, OutputFormat::Markdown);
+		assert!(rendered.contains("## Sync Check"));
+		assert!(rendered.contains("aligned"));
+		assert!(rendered.contains("### Recommendations"));
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn handoff_pack_writes_expected_files() {
+		let root = temp_root("handoff-pack");
+		let snapshot = sample_snapshot();
+		let (paths, workspace_dir, export_path, receipt_path) = seed_workspace(&root);
+		let out_dir = root.join("out");
+
+		write_handoff_pack(&snapshot, &paths, &workspace_dir, &export_path, &receipt_path, &out_dir)
+			.expect("handoff pack");
+
+		let handoff_status = out_dir.join("handoff-status.md");
+		let sync_check = out_dir.join("sync-check.txt");
+		let sovereign_brief = out_dir.join("sovereign-brief.md");
+
+		assert!(handoff_status.exists());
+		assert!(sync_check.exists());
+		assert!(sovereign_brief.exists());
+		assert!(fs::read_to_string(&handoff_status).expect("handoff status").contains("## Handoff Status"));
+		assert!(fs::read_to_string(&sync_check).expect("sync check").contains("aligned"));
+		assert!(fs::read_to_string(&sovereign_brief).expect("sovereign brief").contains("## Sovereign GitHub Brief"));
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn handoff_status_can_be_written_to_file() {
+		let root = temp_root("handoff-status-file");
+		let snapshot = sample_snapshot();
+		let (_paths, workspace_dir, export_path, receipt_path) = seed_workspace(&root);
+		let out_path = root.join("handoff-status.md");
+
+		print_handoff_status(
+			&snapshot,
+			&workspace_dir,
+			&export_path,
+			&receipt_path,
+			OutputFormat::Markdown,
+			Some(&out_path),
+		)
+		.expect("handoff status");
+
+		let rendered = fs::read_to_string(&out_path).expect("handoff status file");
+		assert!(rendered.contains("## Handoff Status"));
+		assert!(rendered.contains("ready"));
+		let _ = fs::remove_dir_all(root);
+	}
+}

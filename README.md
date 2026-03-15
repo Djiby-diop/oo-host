@@ -40,6 +40,12 @@ Examples:
 - `cargo run --bin oo-bot -- handoff-status --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- handoff-status --workspace ../llm-baremetal --format markdown --out data/handoff-status.md`
 - `cargo run --bin oo-bot -- handoff-pack --workspace ../llm-baremetal --out data/handoff-pack`
+
+The `handoff-pack` command writes a compact operator bundle:
+
+- `handoff-status.md`
+- `sync-check.txt`
+- `sovereign-brief.md`
 - `cargo run --bin oo-bot -- sovereign-brief --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-brief --workspace ../llm-baremetal --format markdown`
 - `cargo run --bin oo-bot -- github-sovereign-issue "Sovereign integration follow-up" --workspace ../llm-baremetal --format markdown`
@@ -104,6 +110,16 @@ By default the CLI stores data in `./data/`:
 - `organism_recovery.json`
 
 The `data/` directory is local runtime state and is ignored by Git by default.
+
+## CI
+
+The GitHub workflow in [.github/workflows/oo-host-ci.yml](.github/workflows/oo-host-ci.yml):
+
+- runs `cargo check`
+- runs `cargo test`
+- verifies CLI help for key `oo-bot` commands
+- renders a sample `handoff-pack`
+- uploads the rendered handoff artifact bundle
 
 ## Notes
 
