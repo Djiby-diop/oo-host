@@ -140,6 +140,8 @@ enum ReportSubcommand {
         #[arg(long)]
         include_sovereign: bool,
         #[arg(long)]
+        include_sync: bool,
+        #[arg(long)]
         sovereign_workspace: Option<PathBuf>,
     },
 }
@@ -478,6 +480,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 out_dir,
                 journal_count,
                 include_sovereign,
+                include_sync,
                 sovereign_workspace,
             } => {
                 let target_dir = out_dir.unwrap_or_else(|| ctx.paths.data_dir.join("reports").join("daily"));
@@ -486,6 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &target_dir,
                     journal_count,
                     include_sovereign,
+                    include_sync,
                     sovereign_workspace.as_deref(),
                 )?;
                 println!("OK: daily reports written to {}", target_dir.display());
@@ -1991,6 +1995,7 @@ fn write_daily_reports(
     out_dir: &Path,
     journal_count: usize,
     include_sovereign: bool,
+    include_sync: bool,
     sovereign_workspace: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let status_path = out_dir.join("status.md");
@@ -2003,10 +2008,16 @@ fn write_daily_reports(
     let events = read_recent_events(&ctx.paths.journal_path, journal_count)?;
     write_text_file(&journal_path, &render_journal_explain_markdown(&events))?;
 
-    if include_sovereign {
+    if include_sovereign || include_sync {
         let workspace = resolve_sovereign_workspace(sovereign_workspace)?;
-        let sovereign_path = out_dir.join("sovereign.md");
-        write_text_file(&sovereign_path, &render_sovereign_summary_markdown(&workspace)?)?;
+        if include_sovereign {
+            let sovereign_path = out_dir.join("sovereign.md");
+            write_text_file(&sovereign_path, &render_sovereign_summary_markdown(&workspace)?)?;
+        }
+        if include_sync {
+            let sync_path = out_dir.join("sync.md");
+            write_text_file(&sync_path, &render_sync_summary_markdown(ctx, &workspace)?)?;
+        }
     }
 
     Ok(())
@@ -2055,6 +2066,87 @@ fn render_sovereign_summary_markdown(workspace: &Path) -> Result<String, Box<dyn
     }
 
     Ok(lines.join("\n"))
+}
+
+fn render_sync_summary_markdown(
+    ctx: &RuntimeCtx,
+    workspace: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let receipt = read_key_value_file(&workspace.join("OOHANDOFF.TXT"))?;
+    let host = host_sync_fields(ctx);
+    let verdict = compute_sync_verdict(&host, &receipt);
+
+    let mut lines = vec![
+        "# sync summary".to_string(),
+        String::new(),
+        format!("- sovereign_workspace: {}", workspace.display()),
+        format!("- verdict: {}", verdict),
+        String::new(),
+        "## comparisons".to_string(),
+        String::new(),
+    ];
+
+    for (key, host_value) in &host {
+        let receipt_value = receipt.get(key).map(String::as_str).unwrap_or("missing");
+        let status = if receipt_value == host_value { "aligned" } else { "mismatch" };
+        lines.push(format!(
+            "- {}: host=`{}` sovereign=`{}` status=`{}`",
+            key, host_value, receipt_value, status
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn host_sync_fields(ctx: &RuntimeCtx) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    out.insert("organism_id".to_string(), ctx.identity.organism_id.clone());
+    out.insert("mode".to_string(), ctx.state.mode.as_str().to_string());
+    out.insert(
+        "policy_enforcement".to_string(),
+        ctx.state.policy.enforcement.as_str().to_string(),
+    );
+    out.insert(
+        "continuity_epoch".to_string(),
+        ctx.state.continuity_epoch.to_string(),
+    );
+    out.insert(
+        "last_recovery_reason".to_string(),
+        ctx.state
+            .last_recovery_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    out
+}
+
+fn compute_sync_verdict(host: &BTreeMap<String, String>, receipt: &BTreeMap<String, String>) -> &'static str {
+    if receipt.is_empty() {
+        return "receipt_missing";
+    }
+
+    let organism_matches = receipt.get("organism_id") == host.get("organism_id");
+    if !organism_matches {
+        return "organism_mismatch";
+    }
+
+    let host_continuity = host
+        .get("continuity_epoch")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let receipt_continuity = receipt
+        .get("continuity_epoch")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let all_match = host.iter().all(|(key, value)| receipt.get(key) == Some(value));
+    if all_match {
+        "aligned"
+    } else if host_continuity > receipt_continuity {
+        "host_ahead"
+    } else {
+        "drift"
+    }
 }
 
 fn read_key_value_file(path: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
@@ -2671,7 +2763,7 @@ mod tests {
         )
         .expect("append event");
 
-        write_daily_reports(&ctx, &report_dir, 20, false, None).expect("write daily reports");
+        write_daily_reports(&ctx, &report_dir, 20, false, false, None).expect("write daily reports");
 
         let status = fs::read_to_string(report_dir.join("status.md")).expect("read status");
         let next_goal = fs::read_to_string(report_dir.join("next-goal.md")).expect("read next-goal");
@@ -2715,12 +2807,55 @@ mod tests {
         write_text_file(&sovereign_dir.join("OOHANDOFF.TXT"), "organism_id=abc\nmode=normal")
             .expect("write sovereign receipt");
 
-        write_daily_reports(&ctx, &report_dir, 20, true, Some(&sovereign_dir))
+        write_daily_reports(&ctx, &report_dir, 20, true, false, Some(&sovereign_dir))
             .expect("write daily reports with sovereign");
 
         let sovereign = fs::read_to_string(report_dir.join("sovereign.md")).expect("read sovereign");
         assert!(sovereign.contains("# sovereign summary"));
         assert!(sovereign.contains("- organism_id: abc"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_sync_summary_markdown_reports_alignment() {
+        let dir = env::temp_dir().join(format!("oo-host-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create sync dir");
+        write_text_file(
+            &dir.join("OOHANDOFF.TXT"),
+            "organism_id=org-1\nmode=normal\npolicy_enforcement=observe\ncontinuity_epoch=0\nlast_recovery_reason=none",
+        )
+        .expect("write receipt");
+
+        let ctx = sample_ctx(vec![]);
+        let markdown = render_sync_summary_markdown(&ctx, &dir).expect("render sync summary");
+        assert!(markdown.contains("# sync summary"));
+        assert!(markdown.contains("- verdict: aligned"));
+        assert!(markdown.contains("organism_id"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_daily_reports_can_include_sync_bundle() {
+        let dir = env::temp_dir().join(format!("oo-host-daily-sync-{}", Uuid::new_v4()));
+        let report_dir = dir.join("bundle");
+        let sovereign_dir = dir.join("llm-baremetal");
+        let ctx = sample_ctx(vec![goal("g1", "inspect me", "pending", 3, 1)]);
+
+        fs::create_dir_all(&sovereign_dir).expect("create sovereign dir");
+        write_text_file(
+            &sovereign_dir.join("OOHANDOFF.TXT"),
+            "organism_id=org-1\nmode=normal\npolicy_enforcement=observe\ncontinuity_epoch=0\nlast_recovery_reason=none",
+        )
+        .expect("write sovereign receipt");
+
+        write_daily_reports(&ctx, &report_dir, 20, true, true, Some(&sovereign_dir))
+            .expect("write daily reports with sync");
+
+        let sync = fs::read_to_string(report_dir.join("sync.md")).expect("read sync");
+        assert!(sync.contains("# sync summary"));
+        assert!(sync.contains("- verdict: aligned"));
 
         let _ = fs::remove_dir_all(&dir);
     }
