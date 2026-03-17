@@ -26,6 +26,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goals inspect <goal-id>`
 - `cargo run -- goals inspect <goal-id> --format markdown`
 - `cargo run -- goals inspect <goal-id> --format markdown --out data/goal.md`
+- `cargo run -- report daily --out-dir data/reports/daily`
 - `cargo run -- worker beat clock --role heartbeat`
 - `cargo run -- worker list`
 - `cargo run -- worker watchdog --cycles 5 --interval-ms 1000`
@@ -51,6 +52,7 @@ Worker health notes:
 - `goals inspect` renders one goal with current status, hold reason, notes, and related journal transitions.
 - `status --format markdown` and `goals inspect --format markdown` produce shareable operator summaries.
 - `--out <file>` writes those summaries directly to a file for handoff or reporting.
+- `report daily` writes a compact operator bundle with `status.md`, `next-goal.md`, and `journal-explain.md`.
 
 ## oo-bot companion
 

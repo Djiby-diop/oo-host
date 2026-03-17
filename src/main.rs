@@ -25,6 +25,7 @@ enum Command {
     Goal(GoalCommand),
     Goals(GoalsCommand),
     Journal(JournalCommand),
+    Report(ReportCommand),
     Mode(ModeCommand),
     Policy(PolicyCommand),
     Worker(WorkerCommand),
@@ -110,6 +111,12 @@ struct JournalCommand {
     command: JournalSubcommand,
 }
 
+#[derive(Args, Debug)]
+struct ReportCommand {
+    #[command(subcommand)]
+    command: ReportSubcommand,
+}
+
 #[derive(Subcommand, Debug)]
 enum JournalSubcommand {
     Tail {
@@ -119,6 +126,16 @@ enum JournalSubcommand {
     Explain {
         #[arg(short = 'n', long, default_value_t = 20)]
         count: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReportSubcommand {
+    Daily {
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        journal_count: usize,
     },
 }
 
@@ -450,6 +467,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
             JournalSubcommand::Explain { count } => explain_journal(&ctx.paths.journal_path, count)?,
+        },
+        Command::Report(report) => match report.command {
+            ReportSubcommand::Daily {
+                out_dir,
+                journal_count,
+            } => {
+                let target_dir = out_dir.unwrap_or_else(|| ctx.paths.data_dir.join("reports").join("daily"));
+                write_daily_reports(&ctx, &target_dir, journal_count)?;
+                println!("OK: daily reports written to {}", target_dir.display());
+            }
         },
         Command::Mode(mode) => match mode.command {
             ModeSubcommand::Show => print_mode(&ctx),
@@ -1600,6 +1627,15 @@ fn render_goal_inspect_markdown(goal: &Goal, related_events: &[JournalEvent]) ->
     lines.join("\n")
 }
 
+fn render_next_goal_markdown(ctx: &RuntimeCtx) -> String {
+    if let Some(goal) = select_next_goal(&ctx.state) {
+        let related_events = collect_goal_events(&ctx.paths.journal_path, goal).unwrap_or_default();
+        return render_goal_inspect_markdown(goal, &related_events);
+    }
+
+    ["# next goal".to_string(), String::new(), "- none".to_string()].join("\n")
+}
+
 fn select_next_goal(state: &State) -> Option<&Goal> {
     state
         .goals
@@ -1917,6 +1953,44 @@ fn explain_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn render_journal_explain_markdown(events: &[JournalEvent]) -> String {
+    let mut lines = vec!["# journal explain".to_string(), String::new()];
+
+    if events.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for event in events {
+            lines.push(format!(
+                "- [{}] {} | {} | {}",
+                event.ts_epoch_s,
+                event.kind,
+                event.severity,
+                explain_event(event)
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn write_daily_reports(
+    ctx: &RuntimeCtx,
+    out_dir: &Path,
+    journal_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status_path = out_dir.join("status.md");
+    let next_goal_path = out_dir.join("next-goal.md");
+    let journal_path = out_dir.join("journal-explain.md");
+
+    write_text_file(&status_path, &render_status_markdown(ctx))?;
+    write_text_file(&next_goal_path, &render_next_goal_markdown(ctx))?;
+
+    let events = read_recent_events(&ctx.paths.journal_path, journal_count)?;
+    write_text_file(&journal_path, &render_journal_explain_markdown(&events))?;
+
+    Ok(())
+}
+
 fn explain_event(event: &JournalEvent) -> String {
     match event.kind.as_str() {
         "goal_note" => format!(
@@ -2001,6 +2075,9 @@ fn save_recovery_snapshot(path: &Path, state: &State) -> Result<(), Box<dyn std:
 }
 
 fn append_event(path: &Path, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(&mut file, event)?;
     file.write_all(b"\n")?;
@@ -2406,6 +2483,29 @@ mod tests {
     }
 
     #[test]
+    fn render_journal_explain_markdown_contains_event_explanations() {
+        let events = vec![JournalEvent {
+            event_id: "e1".to_string(),
+            ts_epoch_s: 11,
+            organism_id: "org-1".to_string(),
+            runtime_habitat: "host_test".to_string(),
+            runtime_instance_id: "run-1".to_string(),
+            kind: "worker_health".to_string(),
+            severity: "warn".to_string(),
+            summary: "1 worker stale; mode degraded".to_string(),
+            reason: Some("stale_worker_detected".to_string()),
+            action: Some("mode_set_degraded".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        }];
+
+        let markdown = render_journal_explain_markdown(&events);
+        assert!(markdown.contains("# journal explain"));
+        assert!(markdown.contains("worker health transition"));
+        assert!(markdown.contains("mode_set_degraded"));
+    }
+
+    #[test]
     fn render_goal_inspect_text_contains_notes_and_events() {
         let mut goal = goal("g1", "inspect me", "doing", 3, 1);
         goal.notes.push(GoalNote {
@@ -2446,6 +2546,46 @@ mod tests {
         assert!(saved.contains("hello"));
 
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_daily_reports_creates_expected_bundle() {
+        let dir = env::temp_dir().join(format!("oo-host-daily-{}", Uuid::new_v4()));
+        let report_dir = dir.join("bundle");
+        let journal_path = dir.join("organism_journal.jsonl");
+        let mut ctx = sample_ctx(vec![goal("g1", "inspect me", "pending", 3, 1)]);
+        ctx.paths = AppPaths::new(dir.clone());
+
+        append_event(
+            &journal_path,
+            &JournalEvent {
+                event_id: "e1".to_string(),
+                ts_epoch_s: 11,
+                organism_id: "org-1".to_string(),
+                runtime_habitat: "host_test".to_string(),
+                runtime_instance_id: "run-1".to_string(),
+                kind: "goal_note".to_string(),
+                severity: "info".to_string(),
+                summary: "goal note added: inspect me".to_string(),
+                reason: None,
+                action: Some("goal_note_add".to_string()),
+                result: Some("ok".to_string()),
+                continuity_epoch: 0,
+            },
+        )
+        .expect("append event");
+
+        write_daily_reports(&ctx, &report_dir, 20).expect("write daily reports");
+
+        let status = fs::read_to_string(report_dir.join("status.md")).expect("read status");
+        let next_goal = fs::read_to_string(report_dir.join("next-goal.md")).expect("read next-goal");
+        let journal = fs::read_to_string(report_dir.join("journal-explain.md")).expect("read journal");
+
+        assert!(status.contains("# oo-host status"));
+        assert!(next_goal.contains("# goal g1") || next_goal.contains("# next goal"));
+        assert!(journal.contains("# journal explain"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
