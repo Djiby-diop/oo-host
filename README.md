@@ -57,6 +57,7 @@ Worker health notes:
 - `report daily` writes a compact operator bundle with `status.md`, `next-goal.md`, and `journal-explain.md`.
 - `report daily --include-sovereign` also writes `sovereign.md` by summarizing the sibling [llm-baremetal](../llm-baremetal) workspace when present.
 - `report daily --include-sync` also writes `sync.md` with a direct host-versus-sovereign receipt comparison.
+- `sync.md` now includes mismatched fields and recommended operator actions for cases like `host_ahead`, `drift`, or `organism_mismatch`.
 
 ## oo-bot companion
 

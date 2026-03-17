@@ -2075,6 +2075,8 @@ fn render_sync_summary_markdown(
     let receipt = read_key_value_file(&workspace.join("OOHANDOFF.TXT"))?;
     let host = host_sync_fields(ctx);
     let verdict = compute_sync_verdict(&host, &receipt);
+    let mismatches = collect_sync_mismatches(&host, &receipt);
+    let actions = recommend_sync_actions(verdict, &mismatches);
 
     let mut lines = vec![
         "# sync summary".to_string(),
@@ -2095,7 +2097,93 @@ fn render_sync_summary_markdown(
         ));
     }
 
+    lines.push(String::new());
+    lines.push("## mismatches".to_string());
+    lines.push(String::new());
+    if mismatches.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for mismatch in &mismatches {
+            lines.push(format!(
+                "- {}: host=`{}` sovereign=`{}`",
+                mismatch.field, mismatch.host_value, mismatch.receipt_value
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## recommended actions".to_string());
+    lines.push(String::new());
+    for action in actions {
+        lines.push(format!("- {}", action));
+    }
+
     Ok(lines.join("\n"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncMismatch {
+    field: String,
+    host_value: String,
+    receipt_value: String,
+}
+
+fn collect_sync_mismatches(
+    host: &BTreeMap<String, String>,
+    receipt: &BTreeMap<String, String>,
+) -> Vec<SyncMismatch> {
+    host.iter()
+        .filter_map(|(field, host_value)| {
+            let receipt_value = receipt
+                .get(field)
+                .cloned()
+                .unwrap_or_else(|| "missing".to_string());
+            if receipt_value == *host_value {
+                None
+            } else {
+                Some(SyncMismatch {
+                    field: field.clone(),
+                    host_value: host_value.clone(),
+                    receipt_value,
+                })
+            }
+        })
+        .collect()
+}
+
+fn recommend_sync_actions(verdict: &str, mismatches: &[SyncMismatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    match verdict {
+        "aligned" => out.push("No action required; host state and sovereign receipt are aligned.".to_string()),
+        "receipt_missing" => {
+            out.push("Generate or collect `OOHANDOFF.TXT` from the sovereign workspace before trusting sync state.".to_string());
+            out.push("Run the sovereign handoff flow so the receipt is refreshed beside the workspace.".to_string());
+        }
+        "organism_mismatch" => {
+            out.push("Stop cross-runtime handoff until both sides point to the same organism identifier again.".to_string());
+            out.push("Verify the correct sovereign workspace is selected before applying any further host actions.".to_string());
+        }
+        "host_ahead" => {
+            out.push("Export or apply the latest host handoff so the sovereign receipt catches up.".to_string());
+            out.push("Re-run the daily report after the next handoff application to confirm convergence.".to_string());
+        }
+        "drift" => {
+            out.push("Inspect the mismatched fields and determine whether host or sovereign state changed unexpectedly.".to_string());
+            out.push("Repair the drift before the next handoff cycle so continuity and governance stay consistent.".to_string());
+        }
+        _ => out.push("Review the sync comparison manually before proceeding.".to_string()),
+    }
+
+    if !mismatches.is_empty() && verdict != "aligned" {
+        let fields = mismatches
+            .iter()
+            .map(|m| m.field.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!("Focus first on these fields: {}.", fields));
+    }
+
+    out
 }
 
 fn host_sync_fields(ctx: &RuntimeCtx) -> BTreeMap<String, String> {
@@ -2832,8 +2920,39 @@ mod tests {
         assert!(markdown.contains("# sync summary"));
         assert!(markdown.contains("- verdict: aligned"));
         assert!(markdown.contains("organism_id"));
+        assert!(markdown.contains("## recommended actions"));
+        assert!(markdown.contains("No action required"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recommend_sync_actions_reports_host_ahead_guidance() {
+        let mismatches = vec![SyncMismatch {
+            field: "continuity_epoch".to_string(),
+            host_value: "2".to_string(),
+            receipt_value: "1".to_string(),
+        }];
+
+        let actions = recommend_sync_actions("host_ahead", &mismatches);
+        assert!(actions.iter().any(|item| item.contains("catches up")));
+        assert!(actions.iter().any(|item| item.contains("continuity_epoch")));
+    }
+
+    #[test]
+    fn collect_sync_mismatches_returns_only_different_fields() {
+        let mut host = BTreeMap::new();
+        host.insert("organism_id".to_string(), "org-1".to_string());
+        host.insert("mode".to_string(), "normal".to_string());
+
+        let mut receipt = BTreeMap::new();
+        receipt.insert("organism_id".to_string(), "org-1".to_string());
+        receipt.insert("mode".to_string(), "safe".to_string());
+
+        let mismatches = collect_sync_mismatches(&host, &receipt);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].field, "mode");
+        assert_eq!(mismatches[0].receipt_value, "safe");
     }
 
     #[test]
