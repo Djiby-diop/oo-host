@@ -37,6 +37,8 @@ enum Command {
 struct StatusCommand {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +99,8 @@ enum GoalsSubcommand {
         goal_id: String,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -394,7 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ctx = bootstrap(cli.data_dir)?;
 
     match cli.command {
-        Command::Status(status) => print_status(&ctx, status.format),
+        Command::Status(status) => print_status(&ctx, status.format, status.out.as_deref())?,
         Command::Goal(goal) => match goal.command {
             GoalSubcommand::Add {
                 title,
@@ -437,7 +441,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
             GoalsSubcommand::Next => print_next_goal(&ctx),
-            GoalsSubcommand::Inspect { goal_id, format } => inspect_goal(&ctx, &goal_id, format)?,
+            GoalsSubcommand::Inspect {
+                goal_id,
+                format,
+                out,
+            } => inspect_goal(&ctx, &goal_id, format, out.as_deref())?,
         },
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
@@ -1318,39 +1326,53 @@ fn run_worker_watchdog(
     Ok(())
 }
 
-fn print_status(ctx: &RuntimeCtx, format: OutputFormat) {
+fn print_status(
+    ctx: &RuntimeCtx,
+    format: OutputFormat,
+    out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if format.is_markdown() {
-        println!("{}", render_status_markdown(ctx));
-        return;
+        let rendered = render_status_markdown(ctx);
+        emit_report(&rendered, out)?;
+        return Ok(());
     }
 
-    println!("organism_id       : {}", ctx.identity.organism_id);
-    println!("genesis_id        : {}", ctx.identity.genesis_id);
-    println!("runtime_habitat   : {}", ctx.identity.runtime_habitat);
-    println!("runtime_instance  : {}", ctx.runtime_instance_id);
-    println!("start_count       : {}", ctx.state.boot_or_start_count);
-    println!("continuity_epoch  : {}", ctx.state.continuity_epoch);
-    println!("mode              : {}", ctx.state.mode.as_str());
-    println!("policy            : {}", ctx.state.policy.enforcement.as_str());
-    println!("last_clean        : {}", ctx.state.last_clean_shutdown);
-    println!(
-        "last_recovery     : {}",
-        ctx.state.last_recovery_reason.as_deref().unwrap_or("none")
-    );
-    println!("goals             : {}", ctx.state.goals.len());
+    let rendered = render_status_text(ctx);
+    emit_report(&rendered, out)?;
+    Ok(())
+}
+
+fn render_status_text(ctx: &RuntimeCtx) -> String {
+    let mut lines = vec![
+        format!("organism_id       : {}", ctx.identity.organism_id),
+        format!("genesis_id        : {}", ctx.identity.genesis_id),
+        format!("runtime_habitat   : {}", ctx.identity.runtime_habitat),
+        format!("runtime_instance  : {}", ctx.runtime_instance_id),
+        format!("start_count       : {}", ctx.state.boot_or_start_count),
+        format!("continuity_epoch  : {}", ctx.state.continuity_epoch),
+        format!("mode              : {}", ctx.state.mode.as_str()),
+        format!("policy            : {}", ctx.state.policy.enforcement.as_str()),
+        format!("last_clean        : {}", ctx.state.last_clean_shutdown),
+        format!(
+            "last_recovery     : {}",
+            ctx.state.last_recovery_reason.as_deref().unwrap_or("none")
+        ),
+        format!("goals             : {}", ctx.state.goals.len()),
+    ];
     let stale_workers = count_stale_workers(&ctx.state, now_epoch_s());
     let alive_workers = ctx.state.workers.len().saturating_sub(stale_workers);
-    println!("workers           : {}", ctx.state.workers.len());
-    println!("workers_alive     : {}", alive_workers);
-    println!("workers_stale     : {}", stale_workers);
+    lines.push(format!("workers           : {}", ctx.state.workers.len()));
+    lines.push(format!("workers_alive     : {}", alive_workers));
+    lines.push(format!("workers_stale     : {}", stale_workers));
     if let Some(goal) = select_next_goal(&ctx.state) {
-        println!("next_goal_id      : {}", goal.goal_id);
-        println!("next_goal_title   : {}", goal.title);
-        println!("next_goal_prio    : {}", goal.priority);
-        println!("next_goal_status  : {}", goal.status);
+        lines.push(format!("next_goal_id      : {}", goal.goal_id));
+        lines.push(format!("next_goal_title   : {}", goal.title));
+        lines.push(format!("next_goal_prio    : {}", goal.priority));
+        lines.push(format!("next_goal_status  : {}", goal.status));
     } else {
-        println!("next_goal_id      : none");
+        lines.push("next_goal_id      : none".to_string());
     }
+    lines.join("\n")
 }
 
 fn render_status_markdown(ctx: &RuntimeCtx) -> String {
@@ -1470,6 +1492,7 @@ fn inspect_goal(
     ctx: &RuntimeCtx,
     goal_id: &str,
     format: OutputFormat,
+    out: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let goal = ctx
         .state
@@ -1481,45 +1504,55 @@ fn inspect_goal(
     let related_events = collect_goal_events(&ctx.paths.journal_path, goal)?;
 
     if format.is_markdown() {
-        println!("{}", render_goal_inspect_markdown(goal, &related_events));
+        let rendered = render_goal_inspect_markdown(goal, &related_events);
+        emit_report(&rendered, out)?;
         return Ok(());
     }
 
-    println!("goal_id       : {}", goal.goal_id);
-    println!("title         : {}", goal.title);
-    println!("status        : {}", goal.status);
-    println!("hold_reason   : {}", goal.hold_reason.as_deref().unwrap_or("none"));
-    println!("priority      : {}", goal.priority);
-    println!("origin        : {}", goal.origin);
-    println!("safety_class  : {}", goal.safety_class);
-    println!("created_at    : {}", goal.created_at_epoch_s);
-    println!("updated_at    : {}", goal.updated_at_epoch_s);
-    println!("note_count    : {}", goal.notes.len());
+    let rendered = render_goal_inspect_text(goal, &related_events);
+    emit_report(&rendered, out)?;
+
+    Ok(())
+}
+
+fn render_goal_inspect_text(goal: &Goal, related_events: &[JournalEvent]) -> String {
+    let mut lines = vec![
+        format!("goal_id       : {}", goal.goal_id),
+        format!("title         : {}", goal.title),
+        format!("status        : {}", goal.status),
+        format!("hold_reason   : {}", goal.hold_reason.as_deref().unwrap_or("none")),
+        format!("priority      : {}", goal.priority),
+        format!("origin        : {}", goal.origin),
+        format!("safety_class  : {}", goal.safety_class),
+        format!("created_at    : {}", goal.created_at_epoch_s),
+        format!("updated_at    : {}", goal.updated_at_epoch_s),
+        format!("note_count    : {}", goal.notes.len()),
+    ];
 
     if goal.notes.is_empty() {
-        println!("notes         : none");
+        lines.push("notes         : none".to_string());
     } else {
-        println!("notes         :");
+        lines.push("notes         :".to_string());
         for note in &goal.notes {
-            println!("  - [{}] {}: {}", note.ts_epoch_s, note.author, note.text);
+            lines.push(format!("  - [{}] {}: {}", note.ts_epoch_s, note.author, note.text));
         }
     }
 
     if related_events.is_empty() {
-        println!("recent_events : none");
+        lines.push("recent_events : none".to_string());
     } else {
-        println!("recent_events :");
+        lines.push("recent_events :".to_string());
         for event in related_events.iter().rev().take(12).rev() {
-            println!(
+            lines.push(format!(
                 "  - [{}] {} | {}",
                 event.ts_epoch_s,
                 event.kind,
                 explain_event(event)
-            );
+            ));
         }
     }
 
-    Ok(())
+    lines.join("\n")
 }
 
 fn render_goal_inspect_markdown(goal: &Goal, related_events: &[JournalEvent]) -> String {
@@ -1974,10 +2007,34 @@ fn append_event(path: &Path, event: &JournalEvent) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+fn emit_report(contents: &str, out: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = out {
+        write_text_file(path, contents)?;
+        println!("OK: wrote report to {}", path.display());
+    } else {
+        println!("{contents}");
+    }
+    Ok(())
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error>> {
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp)?;
     serde_json::to_writer_pretty(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    drop(file);
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn write_text_file(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(contents.as_bytes())?;
     file.write_all(b"\n")?;
     file.flush()?;
     drop(file);
@@ -2308,6 +2365,16 @@ mod tests {
     }
 
     #[test]
+    fn render_status_text_contains_next_goal_fields() {
+        let ctx = sample_ctx(vec![goal("g1", "inspect me", "pending", 3, 1)]);
+
+        let text = render_status_text(&ctx);
+        assert!(text.contains("organism_id       : org-1"));
+        assert!(text.contains("next_goal_id      : g1"));
+        assert!(text.contains("next_goal_title   : inspect me"));
+    }
+
+    #[test]
     fn render_goal_inspect_markdown_contains_notes_and_events() {
         let mut goal = goal("g1", "inspect me", "doing", 3, 1);
         goal.notes.push(GoalNote {
@@ -2336,6 +2403,50 @@ mod tests {
         assert!(markdown.contains("important context"));
         assert!(markdown.contains("## recent events"));
         assert!(markdown.contains("goal note recorded"));
+    }
+
+    #[test]
+    fn render_goal_inspect_text_contains_notes_and_events() {
+        let mut goal = goal("g1", "inspect me", "doing", 3, 1);
+        goal.notes.push(GoalNote {
+            ts_epoch_s: 10,
+            author: "operator".to_string(),
+            text: "important context".to_string(),
+        });
+        let events = vec![JournalEvent {
+            event_id: "e1".to_string(),
+            ts_epoch_s: 11,
+            organism_id: "org-1".to_string(),
+            runtime_habitat: "host_test".to_string(),
+            runtime_instance_id: "run-1".to_string(),
+            kind: "goal_note".to_string(),
+            severity: "info".to_string(),
+            summary: "goal note added: inspect me".to_string(),
+            reason: None,
+            action: Some("goal_note_add".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        }];
+
+        let text = render_goal_inspect_text(&goal, &events);
+        assert!(text.contains("goal_id       : g1"));
+        assert!(text.contains("note_count    : 1"));
+        assert!(text.contains("important context"));
+        assert!(text.contains("recent_events :"));
+    }
+
+    #[test]
+    fn write_text_file_persists_report_contents() {
+        let dir = env::temp_dir().join(format!("oo-host-test-out-{}", Uuid::new_v4()));
+        let path = dir.join("report.md");
+
+        write_text_file(&path, "# report\nhello").expect("write report");
+        let saved = fs::read_to_string(&path).expect("read report");
+        assert!(saved.contains("# report"));
+        assert!(saved.contains("hello"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
