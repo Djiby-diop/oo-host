@@ -25,6 +25,7 @@ enum Command {
     Journal(JournalCommand),
     Mode(ModeCommand),
     Policy(PolicyCommand),
+    Worker(WorkerCommand),
     Tick,
     Recover,
     Export(ExportCommand),
@@ -104,6 +105,24 @@ enum ModeSubcommand {
 struct PolicyCommand {
     #[command(subcommand)]
     command: PolicySubcommand,
+}
+
+#[derive(Args, Debug)]
+struct WorkerCommand {
+    #[command(subcommand)]
+    command: WorkerSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkerSubcommand {
+    List,
+    Beat {
+        worker_id: String,
+        #[arg(long, default_value = "generic")]
+        role: String,
+        #[arg(long, default_value = "heartbeat")]
+        summary: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -212,7 +231,18 @@ struct State {
     mode: RuntimeMode,
     #[serde(default = "default_policy_state")]
     policy: PolicyState,
+    #[serde(default)]
+    workers: Vec<WorkerState>,
     goals: Vec<Goal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerState {
+    worker_id: String,
+    role: String,
+    status: String,
+    last_heartbeat_epoch_s: u64,
+    heartbeat_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -348,6 +378,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("OK: policy updated");
             }
         },
+        Command::Worker(worker) => match worker.command {
+            WorkerSubcommand::List => list_workers(&ctx),
+            WorkerSubcommand::Beat {
+                worker_id,
+                role,
+                summary,
+            } => {
+                beat_worker(&mut ctx, &worker_id, &role, &summary)?;
+                println!("OK: worker heartbeat recorded");
+            }
+        },
         Command::Tick => {
             let result = scheduler_tick(&mut ctx)?;
             println!("tick_result       : {}", result);
@@ -461,6 +502,7 @@ fn load_or_create_state(path: &Path) -> Result<State, Box<dyn std::error::Error>
             llm_advisory_only: true,
             enforcement: PolicyEnforcement::Observe,
         },
+        workers: Vec::new(),
         goals: Vec::new(),
     };
     write_json(path, &state)?;
@@ -692,6 +734,51 @@ fn set_policy_enforcement(
     Ok(())
 }
 
+fn beat_worker(
+    ctx: &mut RuntimeCtx,
+    worker_id: &str,
+    role: &str,
+    summary: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    if let Some(worker) = ctx.state.workers.iter_mut().find(|w| w.worker_id == worker_id) {
+        worker.role = role.to_string();
+        worker.status = "alive".to_string();
+        worker.last_heartbeat_epoch_s = now;
+        worker.heartbeat_count += 1;
+    } else {
+        ctx.state.workers.push(WorkerState {
+            worker_id: worker_id.to_string(),
+            role: role.to_string(),
+            status: "alive".to_string(),
+            last_heartbeat_epoch_s: now,
+            heartbeat_count: 1,
+        });
+    }
+
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "worker_heartbeat".to_string(),
+            severity: "info".to_string(),
+            summary: format!("worker heartbeat: {worker_id} ({summary})"),
+            reason: None,
+            action: Some("worker_beat".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
 fn recover_state(ctx: &mut RuntimeCtx) -> Result<(), Box<dyn std::error::Error>> {
     let mut recovered: State = read_json(&ctx.paths.recovery_path)?;
     recovered.continuity_epoch += 1;
@@ -723,6 +810,31 @@ fn recover_state(ctx: &mut RuntimeCtx) -> Result<(), Box<dyn std::error::Error>>
 
 fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::error::Error>> {
     let now = now_epoch_s();
+    let stale_workers = refresh_worker_health(&mut ctx.state, now);
+
+    if stale_workers > 0 && !matches!(ctx.state.mode, RuntimeMode::Safe) {
+        if !matches!(ctx.state.mode, RuntimeMode::Degraded) {
+            ctx.state.mode = RuntimeMode::Degraded;
+            persist_ctx(ctx)?;
+            append_event(
+                &ctx.paths.journal_path,
+                &JournalEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    ts_epoch_s: now,
+                    organism_id: ctx.identity.organism_id.clone(),
+                    runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                    runtime_instance_id: ctx.runtime_instance_id.clone(),
+                    kind: "worker_health".to_string(),
+                    severity: "warn".to_string(),
+                    summary: format!("{} worker(s) stale; mode degraded", stale_workers),
+                    reason: Some("stale_worker_detected".to_string()),
+                    action: Some("mode_set_degraded".to_string()),
+                    result: Some("ok".to_string()),
+                    continuity_epoch: ctx.state.continuity_epoch,
+                },
+            )?;
+        }
+    }
 
     if let Some(goal) = ctx.state.goals.iter().find(|g| g.status == "doing") {
         let active_title = goal.title.clone();
@@ -907,6 +1019,9 @@ fn print_status(ctx: &RuntimeCtx) {
         ctx.state.last_recovery_reason.as_deref().unwrap_or("none")
     );
     println!("goals             : {}", ctx.state.goals.len());
+    let stale_workers = count_stale_workers(&ctx.state, now_epoch_s());
+    println!("workers           : {}", ctx.state.workers.len());
+    println!("workers_stale     : {}", stale_workers);
     if let Some(goal) = select_next_goal(&ctx.state) {
         println!("next_goal_id      : {}", goal.goal_id);
         println!("next_goal_title   : {}", goal.title);
@@ -926,6 +1041,26 @@ fn print_policy(ctx: &RuntimeCtx) {
     println!("deny_by_default  : {}", ctx.state.policy.deny_by_default);
     println!("llm_advisory_only: {}", ctx.state.policy.llm_advisory_only);
     println!("enforcement      : {}", ctx.state.policy.enforcement.as_str());
+}
+
+fn list_workers(ctx: &RuntimeCtx) {
+    if ctx.state.workers.is_empty() {
+        println!("No workers.");
+        return;
+    }
+
+    let now = now_epoch_s();
+    for worker in &ctx.state.workers {
+        let status = effective_worker_status(worker, now);
+        println!(
+            "{} | {} | {} | beats={} | last={} ",
+            worker.worker_id,
+            worker.role,
+            status,
+            worker.heartbeat_count,
+            worker.last_heartbeat_epoch_s
+        );
+    }
 }
 
 fn list_goals(ctx: &RuntimeCtx) {
@@ -976,6 +1111,36 @@ fn goal_selection_rank(status: &str) -> u8 {
         "pending" => 1,
         _ => 0,
     }
+}
+
+const WORKER_STALE_AFTER_S: u64 = 300;
+
+fn effective_worker_status(worker: &WorkerState, now_epoch_s: u64) -> &'static str {
+    if now_epoch_s.saturating_sub(worker.last_heartbeat_epoch_s) > WORKER_STALE_AFTER_S {
+        "stale"
+    } else {
+        "alive"
+    }
+}
+
+fn count_stale_workers(state: &State, now_epoch_s: u64) -> usize {
+    state
+        .workers
+        .iter()
+        .filter(|w| effective_worker_status(w, now_epoch_s) == "stale")
+        .count()
+}
+
+fn refresh_worker_health(state: &mut State, now_epoch_s: u64) -> usize {
+    let mut stale = 0;
+    for worker in &mut state.workers {
+        let status = effective_worker_status(worker, now_epoch_s).to_string();
+        if status == "stale" {
+            stale += 1;
+        }
+        worker.status = status;
+    }
+    stale
 }
 
 fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1057,6 +1222,7 @@ mod tests {
             last_started_at_epoch_s: 1,
             mode: RuntimeMode::Normal,
             policy: default_policy_state(),
+            workers: Vec::new(),
             goals,
         }
     }
@@ -1122,5 +1288,37 @@ mod tests {
     fn goal_selection_rank_orders_expected_states() {
         assert!(goal_selection_rank("doing") > goal_selection_rank("pending"));
         assert!(goal_selection_rank("pending") > goal_selection_rank("done"));
+    }
+
+    #[test]
+    fn worker_health_marks_worker_stale_after_threshold() {
+        let mut state = sample_state(Vec::new());
+        state.workers.push(WorkerState {
+            worker_id: "w1".to_string(),
+            role: "clock".to_string(),
+            status: "alive".to_string(),
+            last_heartbeat_epoch_s: 10,
+            heartbeat_count: 1,
+        });
+
+        let stale = refresh_worker_health(&mut state, 10 + WORKER_STALE_AFTER_S + 1);
+        assert_eq!(stale, 1);
+        assert_eq!(state.workers[0].status, "stale");
+    }
+
+    #[test]
+    fn worker_health_keeps_recent_worker_alive() {
+        let mut state = sample_state(Vec::new());
+        state.workers.push(WorkerState {
+            worker_id: "w1".to_string(),
+            role: "clock".to_string(),
+            status: "unknown".to_string(),
+            last_heartbeat_epoch_s: 100,
+            heartbeat_count: 2,
+        });
+
+        let stale = refresh_worker_health(&mut state, 100 + WORKER_STALE_AFTER_S);
+        assert_eq!(stale, 0);
+        assert_eq!(state.workers[0].status, "alive");
     }
 }

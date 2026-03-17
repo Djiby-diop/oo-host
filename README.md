@@ -18,6 +18,8 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goal abort <goal-id> --reason operator_abort`
 - `cargo run -- goals list`
 - `cargo run -- goals next`
+- `cargo run -- worker beat clock --role heartbeat`
+- `cargo run -- worker list`
 - `cargo run -- tick`
 - `cargo run -- journal tail -n 20`
 
