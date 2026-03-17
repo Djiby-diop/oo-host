@@ -60,6 +60,7 @@ struct GoalsCommand {
 #[derive(Subcommand, Debug)]
 enum GoalsSubcommand {
     List,
+    Next,
 }
 
 #[derive(Args, Debug)]
@@ -311,6 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
+            GoalsSubcommand::Next => print_next_goal(&ctx),
         },
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
@@ -720,6 +722,14 @@ fn print_status(ctx: &RuntimeCtx) {
         ctx.state.last_recovery_reason.as_deref().unwrap_or("none")
     );
     println!("goals             : {}", ctx.state.goals.len());
+    if let Some(goal) = select_next_goal(&ctx.state) {
+        println!("next_goal_id      : {}", goal.goal_id);
+        println!("next_goal_title   : {}", goal.title);
+        println!("next_goal_prio    : {}", goal.priority);
+        println!("next_goal_status  : {}", goal.status);
+    } else {
+        println!("next_goal_id      : none");
+    }
 }
 
 fn print_mode(ctx: &RuntimeCtx) {
@@ -745,6 +755,33 @@ fn list_goals(ctx: &RuntimeCtx) {
             goal.goal_id, goal.status, goal.priority, goal.origin, goal.title
         );
     }
+}
+
+fn print_next_goal(ctx: &RuntimeCtx) {
+    match select_next_goal(&ctx.state) {
+        Some(goal) => {
+            println!("goal_id      : {}", goal.goal_id);
+            println!("title        : {}", goal.title);
+            println!("status       : {}", goal.status);
+            println!("priority     : {}", goal.priority);
+            println!("origin       : {}", goal.origin);
+            println!("safety_class : {}", goal.safety_class);
+        }
+        None => println!("No active goals."),
+    }
+}
+
+fn select_next_goal(state: &State) -> Option<&Goal> {
+    state
+        .goals
+        .iter()
+        .filter(|g| g.status != "done" && g.status != "aborted")
+        .max_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| b.created_at_epoch_s.cmp(&a.created_at_epoch_s))
+                .then_with(|| b.goal_id.cmp(&a.goal_id))
+        })
 }
 
 fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -810,5 +847,69 @@ fn detect_habitat() -> &'static str {
         "host_linux"
     } else {
         "host_unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_state(goals: Vec<Goal>) -> State {
+        State {
+            boot_or_start_count: 1,
+            continuity_epoch: 0,
+            last_clean_shutdown: true,
+            last_recovery_reason: None,
+            last_started_at_epoch_s: 1,
+            mode: RuntimeMode::Normal,
+            policy: default_policy_state(),
+            goals,
+        }
+    }
+
+    fn goal(id: &str, title: &str, status: &str, priority: i32, created_at_epoch_s: u64) -> Goal {
+        Goal {
+            goal_id: id.to_string(),
+            title: title.to_string(),
+            status: status.to_string(),
+            priority,
+            created_at_epoch_s,
+            updated_at_epoch_s: created_at_epoch_s,
+            origin: "test".to_string(),
+            safety_class: "normal".to_string(),
+        }
+    }
+
+    #[test]
+    fn next_goal_prefers_highest_priority_active_goal() {
+        let state = sample_state(vec![
+            goal("g1", "low", "pending", 1, 10),
+            goal("g2", "high", "pending", 5, 20),
+            goal("g3", "done", "done", 9, 30),
+        ]);
+
+        let next = select_next_goal(&state).expect("expected active goal");
+        assert_eq!(next.goal_id, "g2");
+    }
+
+    #[test]
+    fn next_goal_breaks_ties_by_oldest_created_goal() {
+        let state = sample_state(vec![
+            goal("g1", "older", "pending", 5, 10),
+            goal("g2", "newer", "pending", 5, 20),
+        ]);
+
+        let next = select_next_goal(&state).expect("expected active goal");
+        assert_eq!(next.goal_id, "g1");
+    }
+
+    #[test]
+    fn next_goal_returns_none_when_only_terminal_goals_exist() {
+        let state = sample_state(vec![
+            goal("g1", "done", "done", 5, 10),
+            goal("g2", "aborted", "aborted", 7, 20),
+        ]);
+
+        assert!(select_next_goal(&state).is_none());
     }
 }

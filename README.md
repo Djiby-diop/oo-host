@@ -15,6 +15,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- status`
 - `cargo run -- goal add "first goal"`
 - `cargo run -- goals list`
+- `cargo run -- goals next`
 - `cargo run -- journal tail -n 20`
 
 ## oo-bot companion
