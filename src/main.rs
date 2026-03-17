@@ -933,7 +933,29 @@ fn recover_state(ctx: &mut RuntimeCtx) -> Result<(), Box<dyn std::error::Error>>
 
 fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::error::Error>> {
     let now = now_epoch_s();
+    let policy_result = apply_policy_homeostasis(ctx, now)?;
     let _ = apply_worker_homeostasis(ctx, now)?;
+
+    if policy_result == "policy_hold_active" {
+        append_event(
+            &ctx.paths.journal_path,
+            &JournalEvent {
+                event_id: Uuid::new_v4().to_string(),
+                ts_epoch_s: now,
+                organism_id: ctx.identity.organism_id.clone(),
+                runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                runtime_instance_id: ctx.runtime_instance_id.clone(),
+                kind: "scheduler_tick".to_string(),
+                severity: "warn".to_string(),
+                summary: "scheduler paused by policy hold".to_string(),
+                reason: Some("policy_hold_active".to_string()),
+                action: Some("tick_pause".to_string()),
+                result: Some("policy_pause".to_string()),
+                continuity_epoch: ctx.state.continuity_epoch,
+            },
+        )?;
+        return Ok("policy_pause");
+    }
 
     if matches!(ctx.state.mode, RuntimeMode::Degraded) {
         append_event(
@@ -1282,6 +1304,10 @@ fn is_actionable_goal_status(status: &str) -> bool {
     status == "doing" || status == "recovering" || status == "pending"
 }
 
+fn is_policy_safe_goal(goal: &Goal) -> bool {
+    goal.safety_class == "normal"
+}
+
 const WORKER_STALE_AFTER_S: u64 = 300;
 
 fn effective_worker_status(worker: &WorkerState, now_epoch_s: u64) -> &'static str {
@@ -1408,6 +1434,72 @@ fn apply_worker_homeostasis(
     Ok(if stale_workers > 0 { "stale_unchanged" } else { "healthy_unchanged" })
 }
 
+fn apply_policy_homeostasis(
+    ctx: &mut RuntimeCtx,
+    now_epoch_s: u64,
+) -> Result<&'static str, Box<dyn std::error::Error>> {
+    if matches!(ctx.state.policy.enforcement, PolicyEnforcement::Enforce)
+        && ctx.state.policy.safe_first
+        && ctx.state.policy.deny_by_default
+    {
+        let blocked_goals = block_policy_unsafe_goals(&mut ctx.state, now_epoch_s);
+        if !blocked_goals.is_empty() {
+            persist_ctx(ctx)?;
+            for goal_title in blocked_goals {
+                append_event(
+                    &ctx.paths.journal_path,
+                    &JournalEvent {
+                        event_id: Uuid::new_v4().to_string(),
+                        ts_epoch_s: now_epoch_s,
+                        organism_id: ctx.identity.organism_id.clone(),
+                        runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                        runtime_instance_id: ctx.runtime_instance_id.clone(),
+                        kind: "goal_policy_hold".to_string(),
+                        severity: "warn".to_string(),
+                        summary: format!("goal held by policy: {goal_title}"),
+                        reason: Some("policy_hold".to_string()),
+                        action: Some("goal_set_blocked".to_string()),
+                        result: Some("ok".to_string()),
+                        continuity_epoch: ctx.state.continuity_epoch,
+                    },
+                )?;
+            }
+            return Ok("policy_hold_active");
+        }
+
+        persist_ctx(ctx)?;
+        return Ok("policy_clear");
+    }
+
+    let released_goals = release_policy_held_goals(&mut ctx.state, now_epoch_s);
+    if !released_goals.is_empty() {
+        persist_ctx(ctx)?;
+        for goal_title in released_goals {
+            append_event(
+                &ctx.paths.journal_path,
+                &JournalEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    ts_epoch_s: now_epoch_s,
+                    organism_id: ctx.identity.organism_id.clone(),
+                    runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                    runtime_instance_id: ctx.runtime_instance_id.clone(),
+                    kind: "goal_policy_release".to_string(),
+                    severity: "notice".to_string(),
+                    summary: format!("goal released from policy hold: {goal_title}"),
+                    reason: Some("policy_relaxed".to_string()),
+                    action: Some("goal_set_recovering".to_string()),
+                    result: Some("ok".to_string()),
+                    continuity_epoch: ctx.state.continuity_epoch,
+                },
+            )?;
+        }
+        return Ok("policy_released");
+    }
+
+    persist_ctx(ctx)?;
+    Ok("policy_clear")
+}
+
 fn block_active_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
     let mut blocked = Vec::new();
     for goal in &mut state.goals {
@@ -1427,6 +1519,32 @@ fn recover_blocked_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
         if goal.status == "blocked"
             && matches!(goal.hold_reason.as_deref(), Some("worker_health"))
         {
+            goal.status = "recovering".to_string();
+            goal.hold_reason = None;
+            goal.updated_at_epoch_s = now_epoch_s;
+            recovering.push(goal.title.clone());
+        }
+    }
+    recovering
+}
+
+fn block_policy_unsafe_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
+    let mut blocked = Vec::new();
+    for goal in &mut state.goals {
+        if is_actionable_goal_status(&goal.status) && !is_policy_safe_goal(goal) {
+            goal.status = "blocked".to_string();
+            goal.hold_reason = Some("policy_hold".to_string());
+            goal.updated_at_epoch_s = now_epoch_s;
+            blocked.push(goal.title.clone());
+        }
+    }
+    blocked
+}
+
+fn release_policy_held_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
+    let mut recovering = Vec::new();
+    for goal in &mut state.goals {
+        if goal.status == "blocked" && matches!(goal.hold_reason.as_deref(), Some("policy_hold")) {
             goal.status = "recovering".to_string();
             goal.hold_reason = None;
             goal.updated_at_epoch_s = now_epoch_s;
@@ -1644,6 +1762,50 @@ mod tests {
         assert!(recovering.is_empty());
         assert_eq!(state.goals[0].status, "blocked");
         assert_eq!(state.goals[0].hold_reason.as_deref(), Some("operator_hold"));
+    }
+
+    #[test]
+    fn block_policy_unsafe_goals_blocks_non_normal_actionable_goals() {
+        let mut state = sample_state(vec![
+            Goal {
+                safety_class: "elevated".to_string(),
+                ..goal("g1", "unsafe", "pending", 1, 1)
+            },
+            goal("g2", "safe", "pending", 1, 2),
+            Goal {
+                safety_class: "admin".to_string(),
+                ..goal("g3", "doing unsafe", "doing", 1, 3)
+            },
+        ]);
+
+        let blocked = block_policy_unsafe_goals(&mut state, 77);
+        assert_eq!(blocked.len(), 2);
+        assert_eq!(state.goals[0].status, "blocked");
+        assert_eq!(state.goals[0].hold_reason.as_deref(), Some("policy_hold"));
+        assert_eq!(state.goals[1].status, "pending");
+        assert_eq!(state.goals[2].status, "blocked");
+        assert_eq!(state.goals[2].hold_reason.as_deref(), Some("policy_hold"));
+    }
+
+    #[test]
+    fn release_policy_held_goals_moves_only_policy_holds_to_recovering() {
+        let mut state = sample_state(vec![
+            Goal {
+                hold_reason: Some("policy_hold".to_string()),
+                ..goal("g1", "policy", "blocked", 1, 1)
+            },
+            Goal {
+                hold_reason: Some("operator_hold".to_string()),
+                ..goal("g2", "operator", "blocked", 1, 2)
+            },
+        ]);
+
+        let released = release_policy_held_goals(&mut state, 88);
+        assert_eq!(released.len(), 1);
+        assert_eq!(state.goals[0].status, "recovering");
+        assert_eq!(state.goals[0].hold_reason, None);
+        assert_eq!(state.goals[1].status, "blocked");
+        assert_eq!(state.goals[1].hold_reason.as_deref(), Some("operator_hold"));
     }
 
     #[test]

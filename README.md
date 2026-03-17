@@ -36,6 +36,8 @@ Worker health notes:
 - A goal in `doing` becomes `blocked` during worker-health degradation, then moves to `recovering` after health restoration.
 - The scheduler prefers `recovering` goals before new `pending` work, and `goal resume` can also restore a blocked or recovering goal manually.
 - Each goal now carries a persisted `hold_reason`, so `blocked` state can distinguish cases like `worker_health`, `operator_hold`, or future policy-driven holds.
+- With `policy enforcement = enforce`, goals whose `safety_class` is not `normal` are automatically moved to `blocked` with `hold_reason=policy_hold`.
+- When enforcement relaxes again, those policy-held goals move to `recovering` and re-enter scheduler priority ahead of fresh `pending` work.
 
 ## oo-bot companion
 
