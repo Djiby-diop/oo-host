@@ -13,6 +13,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 ## Commands
 
 - `cargo run -- status`
+- `cargo run -- status --format markdown`
 - `cargo run -- goal add "first goal"`
 - `cargo run -- goal start <goal-id>`
 - `cargo run -- goal hold <goal-id> --reason operator_hold`
@@ -22,6 +23,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goals list`
 - `cargo run -- goals next`
 - `cargo run -- goals inspect <goal-id>`
+- `cargo run -- goals inspect <goal-id> --format markdown`
 - `cargo run -- worker beat clock --role heartbeat`
 - `cargo run -- worker list`
 - `cargo run -- worker watchdog --cycles 5 --interval-ms 1000`
@@ -45,6 +47,7 @@ Worker health notes:
 - `goal note` attaches persisted human context to a goal without changing its lifecycle status.
 - Goal listings now expose note counts, and `goals next` shows the latest note when one exists.
 - `goals inspect` renders one goal with current status, hold reason, notes, and related journal transitions.
+- `status --format markdown` and `goals inspect --format markdown` produce shareable operator summaries.
 
 ## oo-bot companion
 

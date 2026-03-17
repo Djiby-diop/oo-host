@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Status,
+    Status(StatusCommand),
     Goal(GoalCommand),
     Goals(GoalsCommand),
     Journal(JournalCommand),
@@ -31,6 +31,12 @@ enum Command {
     Tick,
     Recover,
     Export(ExportCommand),
+}
+
+#[derive(Args, Debug)]
+struct StatusCommand {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(Args, Debug)]
@@ -89,6 +95,8 @@ enum GoalsSubcommand {
     Next,
     Inspect {
         goal_id: String,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 }
 
@@ -231,6 +239,13 @@ enum PolicyEnforcement {
     Enforce,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OutputFormat {
+    Text,
+    Markdown,
+}
+
 impl PolicyEnforcement {
     fn as_str(&self) -> &'static str {
         match self {
@@ -238,6 +253,12 @@ impl PolicyEnforcement {
             Self::Observe => "observe",
             Self::Enforce => "enforce",
         }
+    }
+}
+
+impl OutputFormat {
+    fn is_markdown(self) -> bool {
+        matches!(self, Self::Markdown)
     }
 }
 
@@ -373,7 +394,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ctx = bootstrap(cli.data_dir)?;
 
     match cli.command {
-        Command::Status => print_status(&ctx),
+        Command::Status(status) => print_status(&ctx, status.format),
         Command::Goal(goal) => match goal.command {
             GoalSubcommand::Add {
                 title,
@@ -416,7 +437,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
             GoalsSubcommand::Next => print_next_goal(&ctx),
-            GoalsSubcommand::Inspect { goal_id } => inspect_goal(&ctx, &goal_id)?,
+            GoalsSubcommand::Inspect { goal_id, format } => inspect_goal(&ctx, &goal_id, format)?,
         },
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
@@ -1297,7 +1318,12 @@ fn run_worker_watchdog(
     Ok(())
 }
 
-fn print_status(ctx: &RuntimeCtx) {
+fn print_status(ctx: &RuntimeCtx, format: OutputFormat) {
+    if format.is_markdown() {
+        println!("{}", render_status_markdown(ctx));
+        return;
+    }
+
     println!("organism_id       : {}", ctx.identity.organism_id);
     println!("genesis_id        : {}", ctx.identity.genesis_id);
     println!("runtime_habitat   : {}", ctx.identity.runtime_habitat);
@@ -1325,6 +1351,48 @@ fn print_status(ctx: &RuntimeCtx) {
     } else {
         println!("next_goal_id      : none");
     }
+}
+
+fn render_status_markdown(ctx: &RuntimeCtx) -> String {
+    let stale_workers = count_stale_workers(&ctx.state, now_epoch_s());
+    let alive_workers = ctx.state.workers.len().saturating_sub(stale_workers);
+
+    let mut lines = vec![
+        "# oo-host status".to_string(),
+        String::new(),
+        format!("- organism_id: {}", ctx.identity.organism_id),
+        format!("- genesis_id: {}", ctx.identity.genesis_id),
+        format!("- runtime_habitat: {}", ctx.identity.runtime_habitat),
+        format!("- runtime_instance: {}", ctx.runtime_instance_id),
+        format!("- start_count: {}", ctx.state.boot_or_start_count),
+        format!("- continuity_epoch: {}", ctx.state.continuity_epoch),
+        format!("- mode: {}", ctx.state.mode.as_str()),
+        format!("- policy: {}", ctx.state.policy.enforcement.as_str()),
+        format!("- last_clean: {}", ctx.state.last_clean_shutdown),
+        format!(
+            "- last_recovery: {}",
+            ctx.state.last_recovery_reason.as_deref().unwrap_or("none")
+        ),
+        format!("- goals: {}", ctx.state.goals.len()),
+        format!("- workers: {}", ctx.state.workers.len()),
+        format!("- workers_alive: {}", alive_workers),
+        format!("- workers_stale: {}", stale_workers),
+    ];
+
+    lines.push(String::new());
+    lines.push("## next goal".to_string());
+    lines.push(String::new());
+    if let Some(goal) = select_next_goal(&ctx.state) {
+        lines.push(format!("- id: {}", goal.goal_id));
+        lines.push(format!("- title: {}", goal.title));
+        lines.push(format!("- status: {}", goal.status));
+        lines.push(format!("- priority: {}", goal.priority));
+        lines.push(format!("- hold_reason: {}", goal.hold_reason.as_deref().unwrap_or("none")));
+    } else {
+        lines.push("- none".to_string());
+    }
+
+    lines.join("\n")
 }
 
 fn print_mode(ctx: &RuntimeCtx) {
@@ -1398,13 +1466,24 @@ fn print_next_goal(ctx: &RuntimeCtx) {
     }
 }
 
-fn inspect_goal(ctx: &RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn inspect_goal(
+    ctx: &RuntimeCtx,
+    goal_id: &str,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let goal = ctx
         .state
         .goals
         .iter()
         .find(|g| g.goal_id == goal_id)
         .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    let related_events = collect_goal_events(&ctx.paths.journal_path, goal)?;
+
+    if format.is_markdown() {
+        println!("{}", render_goal_inspect_markdown(goal, &related_events));
+        return Ok(());
+    }
 
     println!("goal_id       : {}", goal.goal_id);
     println!("title         : {}", goal.title);
@@ -1426,7 +1505,6 @@ fn inspect_goal(ctx: &RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::erro
         }
     }
 
-    let related_events = collect_goal_events(&ctx.paths.journal_path, goal)?;
     if related_events.is_empty() {
         println!("recent_events : none");
     } else {
@@ -1442,6 +1520,51 @@ fn inspect_goal(ctx: &RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::erro
     }
 
     Ok(())
+}
+
+fn render_goal_inspect_markdown(goal: &Goal, related_events: &[JournalEvent]) -> String {
+    let mut lines = vec![
+        format!("# goal {}", goal.goal_id),
+        String::new(),
+        format!("- title: {}", goal.title),
+        format!("- status: {}", goal.status),
+        format!("- hold_reason: {}", goal.hold_reason.as_deref().unwrap_or("none")),
+        format!("- priority: {}", goal.priority),
+        format!("- origin: {}", goal.origin),
+        format!("- safety_class: {}", goal.safety_class),
+        format!("- created_at: {}", goal.created_at_epoch_s),
+        format!("- updated_at: {}", goal.updated_at_epoch_s),
+        format!("- note_count: {}", goal.notes.len()),
+        String::new(),
+        "## notes".to_string(),
+        String::new(),
+    ];
+
+    if goal.notes.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for note in &goal.notes {
+            lines.push(format!("- [{}] {}: {}", note.ts_epoch_s, note.author, note.text));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## recent events".to_string());
+    lines.push(String::new());
+    if related_events.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for event in related_events.iter().rev().take(12).rev() {
+            lines.push(format!(
+                "- [{}] {}: {}",
+                event.ts_epoch_s,
+                event.kind,
+                explain_event(event)
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn select_next_goal(state: &State) -> Option<&Goal> {
@@ -1898,6 +2021,7 @@ fn detect_habitat() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     fn sample_state(goals: Vec<Goal>) -> State {
         State {
@@ -1925,6 +2049,21 @@ mod tests {
             updated_at_epoch_s: created_at_epoch_s,
             origin: "test".to_string(),
             safety_class: "normal".to_string(),
+        }
+    }
+
+    fn sample_ctx(goals: Vec<Goal>) -> RuntimeCtx {
+        let tmp = env::temp_dir().join(format!("oo-host-test-{}", Uuid::new_v4()));
+        RuntimeCtx {
+            paths: AppPaths::new(tmp),
+            identity: Identity {
+                organism_id: "org-1".to_string(),
+                genesis_id: "gen-1".to_string(),
+                runtime_habitat: "host_test".to_string(),
+                created_at_epoch_s: 1,
+            },
+            state: sample_state(goals),
+            runtime_instance_id: "run-1".to_string(),
         }
     }
 
@@ -2155,6 +2294,48 @@ mod tests {
         assert!(event_mentions_goal(&by_title, &goal));
         assert!(event_mentions_goal(&by_id, &goal));
         assert!(!event_mentions_goal(&other, &goal));
+    }
+
+    #[test]
+    fn render_status_markdown_contains_next_goal_section() {
+        let ctx = sample_ctx(vec![goal("g1", "inspect me", "pending", 3, 1)]);
+
+        let markdown = render_status_markdown(&ctx);
+        assert!(markdown.contains("# oo-host status"));
+        assert!(markdown.contains("## next goal"));
+        assert!(markdown.contains("- id: g1"));
+        assert!(markdown.contains("- title: inspect me"));
+    }
+
+    #[test]
+    fn render_goal_inspect_markdown_contains_notes_and_events() {
+        let mut goal = goal("g1", "inspect me", "doing", 3, 1);
+        goal.notes.push(GoalNote {
+            ts_epoch_s: 10,
+            author: "operator".to_string(),
+            text: "important context".to_string(),
+        });
+        let events = vec![JournalEvent {
+            event_id: "e1".to_string(),
+            ts_epoch_s: 11,
+            organism_id: "org-1".to_string(),
+            runtime_habitat: "host_test".to_string(),
+            runtime_instance_id: "run-1".to_string(),
+            kind: "goal_note".to_string(),
+            severity: "info".to_string(),
+            summary: "goal note added: inspect me".to_string(),
+            reason: None,
+            action: Some("goal_note_add".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        }];
+
+        let markdown = render_goal_inspect_markdown(&goal, &events);
+        assert!(markdown.contains("# goal g1"));
+        assert!(markdown.contains("## notes"));
+        assert!(markdown.contains("important context"));
+        assert!(markdown.contains("## recent events"));
+        assert!(markdown.contains("goal note recorded"));
     }
 
     #[test]
