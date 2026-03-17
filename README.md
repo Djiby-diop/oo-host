@@ -25,6 +25,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- worker watchdog --cycles 5 --interval-ms 1000`
 - `cargo run -- tick`
 - `cargo run -- journal tail -n 20`
+- `cargo run -- journal explain -n 20`
 
 Worker health notes:
 
@@ -38,6 +39,7 @@ Worker health notes:
 - Each goal now carries a persisted `hold_reason`, so `blocked` state can distinguish cases like `worker_health`, `operator_hold`, or future policy-driven holds.
 - With `policy enforcement = enforce`, goals whose `safety_class` is not `normal` are automatically moved to `blocked` with `hold_reason=policy_hold`.
 - When enforcement relaxes again, those policy-held goals move to `recovering` and re-enter scheduler priority ahead of fresh `pending` work.
+- `journal explain` renders recent journal entries as operator-readable transition summaries instead of raw JSONL.
 
 ## oo-bot companion
 

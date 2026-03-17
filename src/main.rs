@@ -95,6 +95,10 @@ enum JournalSubcommand {
         #[arg(short = 'n', long, default_value_t = 20)]
         count: usize,
     },
+    Explain {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -389,6 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
+            JournalSubcommand::Explain { count } => explain_journal(&ctx.paths.journal_path, count)?,
         },
         Command::Mode(mode) => match mode.command {
             ModeSubcommand::Show => print_mode(&ctx),
@@ -1570,6 +1575,96 @@ fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+fn explain_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let events = read_recent_events(path, count)?;
+    if events.is_empty() {
+        println!("Journal is empty.");
+        return Ok(());
+    }
+
+    for event in events {
+        println!(
+            "[{}] {} | {} | {}",
+            event.ts_epoch_s,
+            event.kind,
+            event.severity,
+            explain_event(&event)
+        );
+    }
+
+    Ok(())
+}
+
+fn explain_event(event: &JournalEvent) -> String {
+    match event.kind.as_str() {
+        "goal_hold" => format!(
+            "operator hold applied; summary='{}'; reason={}",
+            event.summary,
+            event.reason.as_deref().unwrap_or("none")
+        ),
+        "goal_policy_hold" => format!(
+            "governance hold applied; summary='{}'; reason={}",
+            event.summary,
+            event.reason.as_deref().unwrap_or("none")
+        ),
+        "goal_policy_release" => format!(
+            "governance hold released; summary='{}'; result={}",
+            event.summary,
+            event.result.as_deref().unwrap_or("none")
+        ),
+        "goal_block" => format!(
+            "worker incident blocked a goal; summary='{}'; reason={}",
+            event.summary,
+            event.reason.as_deref().unwrap_or("none")
+        ),
+        "goal_recover" => format!(
+            "goal entered recovery; summary='{}'; reason={}",
+            event.summary,
+            event.reason.as_deref().unwrap_or("none")
+        ),
+        "goal_resume" => format!(
+            "goal resumed; summary='{}'; action={}",
+            event.summary,
+            event.action.as_deref().unwrap_or("none")
+        ),
+        "worker_health" => format!(
+            "worker health transition; summary='{}'; action={}; result={}",
+            event.summary,
+            event.action.as_deref().unwrap_or("none"),
+            event.result.as_deref().unwrap_or("none")
+        ),
+        "scheduler_tick" => format!(
+            "scheduler decision; summary='{}'; reason={}; result={}",
+            event.summary,
+            event.reason.as_deref().unwrap_or("none"),
+            event.result.as_deref().unwrap_or("none")
+        ),
+        "goal_start" | "goal_complete" | "goal_abort" | "goal_create" => format!(
+            "goal lifecycle; summary='{}'; action={}; result={}",
+            event.summary,
+            event.action.as_deref().unwrap_or("none"),
+            event.result.as_deref().unwrap_or("none")
+        ),
+        "worker_heartbeat" => format!(
+            "worker heartbeat observed; summary='{}'; result={}",
+            event.summary,
+            event.result.as_deref().unwrap_or("none")
+        ),
+        "policy_decision" => format!(
+            "policy changed; summary='{}'; action={}",
+            event.summary,
+            event.action.as_deref().unwrap_or("none")
+        ),
+        _ => format!(
+            "summary='{}'; reason={}; action={}; result={}",
+            event.summary,
+            event.reason.as_deref().unwrap_or("none"),
+            event.action.as_deref().unwrap_or("none"),
+            event.result.as_deref().unwrap_or("none")
+        ),
+    }
+}
+
 fn save_state(path: &Path, state: &State) -> Result<(), Box<dyn std::error::Error>> {
     write_json(path, state)
 }
@@ -1762,6 +1857,51 @@ mod tests {
         assert!(recovering.is_empty());
         assert_eq!(state.goals[0].status, "blocked");
         assert_eq!(state.goals[0].hold_reason.as_deref(), Some("operator_hold"));
+    }
+
+    #[test]
+    fn explain_event_formats_worker_health_transition() {
+        let event = JournalEvent {
+            event_id: "e1".to_string(),
+            ts_epoch_s: 1,
+            organism_id: "o1".to_string(),
+            runtime_habitat: "host".to_string(),
+            runtime_instance_id: "r1".to_string(),
+            kind: "worker_health".to_string(),
+            severity: "warn".to_string(),
+            summary: "1 worker stale; mode degraded".to_string(),
+            reason: Some("stale_worker_detected".to_string()),
+            action: Some("mode_set_degraded".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        };
+
+        let text = explain_event(&event);
+        assert!(text.contains("worker health transition"));
+        assert!(text.contains("mode_set_degraded"));
+        assert!(text.contains("ok"));
+    }
+
+    #[test]
+    fn explain_event_formats_policy_hold() {
+        let event = JournalEvent {
+            event_id: "e2".to_string(),
+            ts_epoch_s: 1,
+            organism_id: "o1".to_string(),
+            runtime_habitat: "host".to_string(),
+            runtime_instance_id: "r1".to_string(),
+            kind: "goal_policy_hold".to_string(),
+            severity: "warn".to_string(),
+            summary: "goal held by policy: unsafe".to_string(),
+            reason: Some("policy_hold".to_string()),
+            action: Some("goal_set_blocked".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        };
+
+        let text = explain_event(&event);
+        assert!(text.contains("governance hold applied"));
+        assert!(text.contains("policy_hold"));
     }
 
     #[test]
