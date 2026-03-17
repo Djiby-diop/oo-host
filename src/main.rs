@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -122,6 +124,12 @@ enum WorkerSubcommand {
         role: String,
         #[arg(long, default_value = "heartbeat")]
         summary: String,
+    },
+    Watchdog {
+        #[arg(long, default_value_t = 3)]
+        cycles: u32,
+        #[arg(long, default_value_t = 0)]
+        interval_ms: u64,
     },
 }
 
@@ -388,6 +396,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 beat_worker(&mut ctx, &worker_id, &role, &summary)?;
                 println!("OK: worker heartbeat recorded");
             }
+            WorkerSubcommand::Watchdog {
+                cycles,
+                interval_ms,
+            } => run_worker_watchdog(&mut ctx, cycles, interval_ms)?,
         },
         Command::Tick => {
             let result = scheduler_tick(&mut ctx)?;
@@ -810,31 +822,7 @@ fn recover_state(ctx: &mut RuntimeCtx) -> Result<(), Box<dyn std::error::Error>>
 
 fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::error::Error>> {
     let now = now_epoch_s();
-    let stale_workers = refresh_worker_health(&mut ctx.state, now);
-
-    if stale_workers > 0 && !matches!(ctx.state.mode, RuntimeMode::Safe) {
-        if !matches!(ctx.state.mode, RuntimeMode::Degraded) {
-            ctx.state.mode = RuntimeMode::Degraded;
-            persist_ctx(ctx)?;
-            append_event(
-                &ctx.paths.journal_path,
-                &JournalEvent {
-                    event_id: Uuid::new_v4().to_string(),
-                    ts_epoch_s: now,
-                    organism_id: ctx.identity.organism_id.clone(),
-                    runtime_habitat: ctx.identity.runtime_habitat.clone(),
-                    runtime_instance_id: ctx.runtime_instance_id.clone(),
-                    kind: "worker_health".to_string(),
-                    severity: "warn".to_string(),
-                    summary: format!("{} worker(s) stale; mode degraded", stale_workers),
-                    reason: Some("stale_worker_detected".to_string()),
-                    action: Some("mode_set_degraded".to_string()),
-                    result: Some("ok".to_string()),
-                    continuity_epoch: ctx.state.continuity_epoch,
-                },
-            )?;
-        }
-    }
+    let _ = apply_worker_homeostasis(ctx, now)?;
 
     if let Some(goal) = ctx.state.goals.iter().find(|g| g.status == "doing") {
         let active_title = goal.title.clone();
@@ -1004,6 +992,32 @@ fn persist_ctx(ctx: &RuntimeCtx) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_worker_watchdog(
+    ctx: &mut RuntimeCtx,
+    cycles: u32,
+    interval_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_cycles = if cycles == 0 { 1 } else { cycles };
+    for i in 0..total_cycles {
+        let now = now_epoch_s();
+        let result = apply_worker_homeostasis(ctx, now)?;
+        let stale = count_stale_workers(&ctx.state, now);
+        let alive = ctx.state.workers.len().saturating_sub(stale);
+        println!(
+            "watchdog.cycle={} result={} mode={} workers_alive={} workers_stale={}",
+            i + 1,
+            result,
+            ctx.state.mode.as_str(),
+            alive,
+            stale
+        );
+        if interval_ms > 0 && i + 1 < total_cycles {
+            thread::sleep(Duration::from_millis(interval_ms));
+        }
+    }
+    Ok(())
+}
+
 fn print_status(ctx: &RuntimeCtx) {
     println!("organism_id       : {}", ctx.identity.organism_id);
     println!("genesis_id        : {}", ctx.identity.genesis_id);
@@ -1020,7 +1034,9 @@ fn print_status(ctx: &RuntimeCtx) {
     );
     println!("goals             : {}", ctx.state.goals.len());
     let stale_workers = count_stale_workers(&ctx.state, now_epoch_s());
+    let alive_workers = ctx.state.workers.len().saturating_sub(stale_workers);
     println!("workers           : {}", ctx.state.workers.len());
+    println!("workers_alive     : {}", alive_workers);
     println!("workers_stale     : {}", stale_workers);
     if let Some(goal) = select_next_goal(&ctx.state) {
         println!("next_goal_id      : {}", goal.goal_id);
@@ -1141,6 +1157,62 @@ fn refresh_worker_health(state: &mut State, now_epoch_s: u64) -> usize {
         worker.status = status;
     }
     stale
+}
+
+fn apply_worker_homeostasis(
+    ctx: &mut RuntimeCtx,
+    now_epoch_s: u64,
+) -> Result<&'static str, Box<dyn std::error::Error>> {
+    let stale_workers = refresh_worker_health(&mut ctx.state, now_epoch_s);
+
+    if stale_workers > 0 && !matches!(ctx.state.mode, RuntimeMode::Safe | RuntimeMode::Degraded) {
+        ctx.state.mode = RuntimeMode::Degraded;
+        persist_ctx(ctx)?;
+        append_event(
+            &ctx.paths.journal_path,
+            &JournalEvent {
+                event_id: Uuid::new_v4().to_string(),
+                ts_epoch_s: now_epoch_s,
+                organism_id: ctx.identity.organism_id.clone(),
+                runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                runtime_instance_id: ctx.runtime_instance_id.clone(),
+                kind: "worker_health".to_string(),
+                severity: "warn".to_string(),
+                summary: format!("{} worker(s) stale; mode degraded", stale_workers),
+                reason: Some("stale_worker_detected".to_string()),
+                action: Some("mode_set_degraded".to_string()),
+                result: Some("ok".to_string()),
+                continuity_epoch: ctx.state.continuity_epoch,
+            },
+        )?;
+        return Ok("mode_degraded");
+    }
+
+    if stale_workers == 0 && !ctx.state.workers.is_empty() && matches!(ctx.state.mode, RuntimeMode::Degraded) {
+        ctx.state.mode = RuntimeMode::Normal;
+        persist_ctx(ctx)?;
+        append_event(
+            &ctx.paths.journal_path,
+            &JournalEvent {
+                event_id: Uuid::new_v4().to_string(),
+                ts_epoch_s: now_epoch_s,
+                organism_id: ctx.identity.organism_id.clone(),
+                runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                runtime_instance_id: ctx.runtime_instance_id.clone(),
+                kind: "worker_health".to_string(),
+                severity: "notice".to_string(),
+                summary: "workers healthy; mode restored to normal".to_string(),
+                reason: Some("worker_health_restored".to_string()),
+                action: Some("mode_set_normal".to_string()),
+                result: Some("ok".to_string()),
+                continuity_epoch: ctx.state.continuity_epoch,
+            },
+        )?;
+        return Ok("mode_restored");
+    }
+
+    persist_ctx(ctx)?;
+    Ok(if stale_workers > 0 { "stale_unchanged" } else { "healthy_unchanged" })
 }
 
 fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1320,5 +1392,26 @@ mod tests {
         let stale = refresh_worker_health(&mut state, 100 + WORKER_STALE_AFTER_S);
         assert_eq!(stale, 0);
         assert_eq!(state.workers[0].status, "alive");
+    }
+
+    #[test]
+    fn stale_worker_count_matches_status() {
+        let mut state = sample_state(Vec::new());
+        state.workers.push(WorkerState {
+            worker_id: "w1".to_string(),
+            role: "clock".to_string(),
+            status: "alive".to_string(),
+            last_heartbeat_epoch_s: 1,
+            heartbeat_count: 1,
+        });
+        state.workers.push(WorkerState {
+            worker_id: "w2".to_string(),
+            role: "fs".to_string(),
+            status: "alive".to_string(),
+            last_heartbeat_epoch_s: 1 + WORKER_STALE_AFTER_S + 5,
+            heartbeat_count: 1,
+        });
+
+        assert_eq!(count_stale_workers(&state, 1 + WORKER_STALE_AFTER_S + 10), 1);
     }
 }

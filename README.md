@@ -20,8 +20,17 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goals next`
 - `cargo run -- worker beat clock --role heartbeat`
 - `cargo run -- worker list`
+- `cargo run -- worker watchdog --cycles 5 --interval-ms 1000`
 - `cargo run -- tick`
 - `cargo run -- journal tail -n 20`
+
+Worker health notes:
+
+- `worker beat` records a worker heartbeat with a role and summary.
+- `worker list` shows whether each worker is currently `alive` or `stale`.
+- `worker watchdog` runs a small supervision loop and prints per-cycle health and mode results.
+- `tick` applies the same homeostasis logic automatically.
+- When workers go stale, the runtime degrades to `Degraded`; when all known workers recover, it restores to `Normal`.
 
 ## oo-bot companion
 
