@@ -21,6 +21,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goal resume <goal-id>`
 - `cargo run -- goals list`
 - `cargo run -- goals next`
+- `cargo run -- goals inspect <goal-id>`
 - `cargo run -- worker beat clock --role heartbeat`
 - `cargo run -- worker list`
 - `cargo run -- worker watchdog --cycles 5 --interval-ms 1000`
@@ -43,6 +44,7 @@ Worker health notes:
 - `journal explain` renders recent journal entries as operator-readable transition summaries instead of raw JSONL.
 - `goal note` attaches persisted human context to a goal without changing its lifecycle status.
 - Goal listings now expose note counts, and `goals next` shows the latest note when one exists.
+- `goals inspect` renders one goal with current status, hold reason, notes, and related journal transitions.
 
 ## oo-bot companion
 

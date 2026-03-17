@@ -87,6 +87,9 @@ struct GoalsCommand {
 enum GoalsSubcommand {
     List,
     Next,
+    Inspect {
+        goal_id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -413,6 +416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
             GoalsSubcommand::Next => print_next_goal(&ctx),
+            GoalsSubcommand::Inspect { goal_id } => inspect_goal(&ctx, &goal_id)?,
         },
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
@@ -1219,6 +1223,48 @@ fn read_recent_events(path: &Path, count: usize) -> Result<Vec<JournalEvent>, Bo
     Ok(events.into_iter().skip(start).collect())
 }
 
+fn read_all_events(path: &Path) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: JournalEvent = serde_json::from_str(&line)?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn collect_goal_events(
+    path: &Path,
+    goal: &Goal,
+) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+    let events = read_all_events(path)?;
+    Ok(events
+        .into_iter()
+        .filter(|event| event_mentions_goal(event, goal))
+        .collect())
+}
+
+fn event_mentions_goal(event: &JournalEvent, goal: &Goal) -> bool {
+    let summary = event.summary.as_str();
+    let reason = event.reason.as_deref().unwrap_or("");
+    let action = event.action.as_deref().unwrap_or("");
+
+    summary.contains(&goal.goal_id)
+        || summary.contains(&goal.title)
+        || reason.contains(&goal.goal_id)
+        || reason.contains(&goal.title)
+        || action.contains(&goal.goal_id)
+}
+
 fn persist_ctx(ctx: &RuntimeCtx) -> Result<(), Box<dyn std::error::Error>> {
     save_state(&ctx.paths.state_path, &ctx.state)?;
     save_recovery_snapshot(&ctx.paths.recovery_path, &ctx.state)?;
@@ -1350,6 +1396,52 @@ fn print_next_goal(ctx: &RuntimeCtx) {
         }
         None => println!("No active goals."),
     }
+}
+
+fn inspect_goal(ctx: &RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let goal = ctx
+        .state
+        .goals
+        .iter()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    println!("goal_id       : {}", goal.goal_id);
+    println!("title         : {}", goal.title);
+    println!("status        : {}", goal.status);
+    println!("hold_reason   : {}", goal.hold_reason.as_deref().unwrap_or("none"));
+    println!("priority      : {}", goal.priority);
+    println!("origin        : {}", goal.origin);
+    println!("safety_class  : {}", goal.safety_class);
+    println!("created_at    : {}", goal.created_at_epoch_s);
+    println!("updated_at    : {}", goal.updated_at_epoch_s);
+    println!("note_count    : {}", goal.notes.len());
+
+    if goal.notes.is_empty() {
+        println!("notes         : none");
+    } else {
+        println!("notes         :");
+        for note in &goal.notes {
+            println!("  - [{}] {}: {}", note.ts_epoch_s, note.author, note.text);
+        }
+    }
+
+    let related_events = collect_goal_events(&ctx.paths.journal_path, goal)?;
+    if related_events.is_empty() {
+        println!("recent_events : none");
+    } else {
+        println!("recent_events :");
+        for event in related_events.iter().rev().take(12).rev() {
+            println!(
+                "  - [{}] {} | {}",
+                event.ts_epoch_s,
+                event.kind,
+                explain_event(event)
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn select_next_goal(state: &State) -> Option<&Goal> {
@@ -2012,6 +2104,57 @@ mod tests {
         assert_eq!(goal.notes.len(), 1);
         assert_eq!(goal.notes[0].author, "operator");
         assert_eq!(goal.notes[0].text, "remember this");
+    }
+
+    #[test]
+    fn event_mentions_goal_matches_title_and_id() {
+        let goal = goal("g1", "inspect me", "doing", 1, 1);
+        let by_title = JournalEvent {
+            event_id: "e1".to_string(),
+            ts_epoch_s: 1,
+            organism_id: "o1".to_string(),
+            runtime_habitat: "host".to_string(),
+            runtime_instance_id: "r1".to_string(),
+            kind: "goal_note".to_string(),
+            severity: "info".to_string(),
+            summary: "goal note added: inspect me".to_string(),
+            reason: None,
+            action: Some("goal_note_add".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        };
+        let by_id = JournalEvent {
+            event_id: "e2".to_string(),
+            ts_epoch_s: 1,
+            organism_id: "o1".to_string(),
+            runtime_habitat: "host".to_string(),
+            runtime_instance_id: "r1".to_string(),
+            kind: "scheduler_tick".to_string(),
+            severity: "notice".to_string(),
+            summary: "scheduler activated goal: g1".to_string(),
+            reason: Some("selected_pending_goal".to_string()),
+            action: Some("tick_start_goal".to_string()),
+            result: Some("goal_started".to_string()),
+            continuity_epoch: 0,
+        };
+        let other = JournalEvent {
+            event_id: "e3".to_string(),
+            ts_epoch_s: 1,
+            organism_id: "o1".to_string(),
+            runtime_habitat: "host".to_string(),
+            runtime_instance_id: "r1".to_string(),
+            kind: "goal_note".to_string(),
+            severity: "info".to_string(),
+            summary: "goal note added: someone else".to_string(),
+            reason: None,
+            action: Some("goal_note_add".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: 0,
+        };
+
+        assert!(event_mentions_goal(&by_title, &goal));
+        assert!(event_mentions_goal(&by_id, &goal));
+        assert!(!event_mentions_goal(&other, &goal));
     }
 
     #[test]
