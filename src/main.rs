@@ -56,6 +56,11 @@ enum GoalSubcommand {
     Start {
         goal_id: String,
     },
+    Hold {
+        goal_id: String,
+        #[arg(long, default_value = "operator_hold")]
+        reason: String,
+    },
     Abort {
         goal_id: String,
         #[arg(long, default_value = "operator_abort")]
@@ -261,6 +266,8 @@ struct Goal {
     goal_id: String,
     title: String,
     status: String,
+    #[serde(default)]
+    hold_reason: Option<String>,
     priority: i32,
     created_at_epoch_s: u64,
     updated_at_epoch_s: u64,
@@ -362,6 +369,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             GoalSubcommand::Start { goal_id } => {
                 start_goal(&mut ctx, &goal_id)?;
                 println!("OK: goal started");
+            }
+            GoalSubcommand::Hold { goal_id, reason } => {
+                hold_goal(&mut ctx, &goal_id, &reason)?;
+                println!("OK: goal held");
             }
             GoalSubcommand::Abort { goal_id, reason } => {
                 abort_goal(&mut ctx, &goal_id, &reason)?;
@@ -553,6 +564,7 @@ fn add_goal(
         goal_id: Uuid::new_v4().to_string(),
         title: title.clone(),
         status: "pending".to_string(),
+        hold_reason: None,
         priority,
         created_at_epoch_s: now,
         updated_at_epoch_s: now,
@@ -594,6 +606,7 @@ fn mark_goal_done(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std
         .ok_or_else(|| format!("goal not found: {goal_id}"))?;
 
     goal.status = "done".to_string();
+    goal.hold_reason = None;
     goal.updated_at_epoch_s = now;
     let title = goal.title.clone();
     persist_ctx(ctx)?;
@@ -611,6 +624,51 @@ fn mark_goal_done(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std
             summary: format!("goal done: {title}"),
             reason: None,
             action: Some("goal_done".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
+fn hold_goal(
+    ctx: &mut RuntimeCtx,
+    goal_id: &str,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    if is_terminal_goal_status(&goal.status) {
+        return Err(format!("goal is terminal: {goal_id}").into());
+    }
+
+    goal.status = "blocked".to_string();
+    goal.hold_reason = Some(reason.to_string());
+    goal.updated_at_epoch_s = now;
+    let title = goal.title.clone();
+    let hold_reason = reason.to_string();
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_hold".to_string(),
+            severity: "warn".to_string(),
+            summary: format!("goal held: {title}"),
+            reason: Some(hold_reason),
+            action: Some("goal_set_blocked".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
         },
@@ -637,6 +695,7 @@ fn resume_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::e
     }
 
     goal.status = "doing".to_string();
+    goal.hold_reason = None;
     goal.updated_at_epoch_s = now;
     let title = goal.title.clone();
     persist_ctx(ctx)?;
@@ -676,6 +735,7 @@ fn start_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::er
     }
 
     goal.status = "doing".to_string();
+    goal.hold_reason = None;
     goal.updated_at_epoch_s = now;
     let title = goal.title.clone();
     persist_ctx(ctx)?;
@@ -719,6 +779,7 @@ fn abort_goal(
     }
 
     goal.status = "aborted".to_string();
+    goal.hold_reason = Some(reason.to_string());
     goal.updated_at_epoch_s = now;
     let title = goal.title.clone();
     let abort_reason = reason.to_string();
@@ -1164,8 +1225,13 @@ fn list_goals(ctx: &RuntimeCtx) {
 
     for goal in &ctx.state.goals {
         println!(
-            "{} | {} | prio={} | {} | {}",
-            goal.goal_id, goal.status, goal.priority, goal.origin, goal.title
+            "{} | {} | prio={} | {} | hold={} | {}",
+            goal.goal_id,
+            goal.status,
+            goal.priority,
+            goal.origin,
+            goal.hold_reason.as_deref().unwrap_or("none"),
+            goal.title
         );
     }
 }
@@ -1176,6 +1242,7 @@ fn print_next_goal(ctx: &RuntimeCtx) {
             println!("goal_id      : {}", goal.goal_id);
             println!("title        : {}", goal.title);
             println!("status       : {}", goal.status);
+            println!("hold_reason  : {}", goal.hold_reason.as_deref().unwrap_or("none"));
             println!("priority     : {}", goal.priority);
             println!("origin       : {}", goal.origin);
             println!("safety_class : {}", goal.safety_class);
@@ -1346,6 +1413,7 @@ fn block_active_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
     for goal in &mut state.goals {
         if goal.status == "doing" || goal.status == "recovering" {
             goal.status = "blocked".to_string();
+            goal.hold_reason = Some("worker_health".to_string());
             goal.updated_at_epoch_s = now_epoch_s;
             blocked.push(goal.title.clone());
         }
@@ -1356,8 +1424,11 @@ fn block_active_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
 fn recover_blocked_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
     let mut recovering = Vec::new();
     for goal in &mut state.goals {
-        if goal.status == "blocked" {
+        if goal.status == "blocked"
+            && matches!(goal.hold_reason.as_deref(), Some("worker_health"))
+        {
             goal.status = "recovering".to_string();
+            goal.hold_reason = None;
             goal.updated_at_epoch_s = now_epoch_s;
             recovering.push(goal.title.clone());
         }
@@ -1454,6 +1525,7 @@ mod tests {
             goal_id: id.to_string(),
             title: title.to_string(),
             status: status.to_string(),
+            hold_reason: None,
             priority,
             created_at_epoch_s,
             updated_at_epoch_s: created_at_epoch_s,
@@ -1535,21 +1607,43 @@ mod tests {
         let blocked = block_active_goals(&mut state, 99);
         assert_eq!(blocked.len(), 2);
         assert_eq!(state.goals[0].status, "blocked");
+        assert_eq!(state.goals[0].hold_reason.as_deref(), Some("worker_health"));
         assert_eq!(state.goals[1].status, "blocked");
+        assert_eq!(state.goals[1].hold_reason.as_deref(), Some("worker_health"));
         assert_eq!(state.goals[2].status, "pending");
     }
 
     #[test]
     fn recover_blocked_goals_moves_blocked_to_recovering() {
         let mut state = sample_state(vec![
-            goal("g1", "blocked", "blocked", 1, 1),
+            Goal {
+                hold_reason: Some("worker_health".to_string()),
+                ..goal("g1", "blocked", "blocked", 1, 1)
+            },
             goal("g2", "pending", "pending", 1, 2),
         ]);
 
         let recovering = recover_blocked_goals(&mut state, 100);
         assert_eq!(recovering.len(), 1);
         assert_eq!(state.goals[0].status, "recovering");
+        assert_eq!(state.goals[0].hold_reason, None);
         assert_eq!(state.goals[1].status, "pending");
+    }
+
+    #[test]
+    fn recover_blocked_goals_ignores_operator_hold() {
+        let mut state = sample_state(vec![
+            Goal {
+                hold_reason: Some("operator_hold".to_string()),
+                ..goal("g1", "blocked", "blocked", 1, 1)
+            },
+            goal("g2", "pending", "pending", 1, 2),
+        ]);
+
+        let recovering = recover_blocked_goals(&mut state, 100);
+        assert!(recovering.is_empty());
+        assert_eq!(state.goals[0].status, "blocked");
+        assert_eq!(state.goals[0].hold_reason.as_deref(), Some("operator_hold"));
     }
 
     #[test]
