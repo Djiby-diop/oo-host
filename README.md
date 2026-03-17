@@ -16,6 +16,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goal add "first goal"`
 - `cargo run -- goal start <goal-id>`
 - `cargo run -- goal hold <goal-id> --reason operator_hold`
+- `cargo run -- goal note <goal-id> "context for operators" --author operator`
 - `cargo run -- goal abort <goal-id> --reason operator_abort`
 - `cargo run -- goal resume <goal-id>`
 - `cargo run -- goals list`
@@ -40,6 +41,8 @@ Worker health notes:
 - With `policy enforcement = enforce`, goals whose `safety_class` is not `normal` are automatically moved to `blocked` with `hold_reason=policy_hold`.
 - When enforcement relaxes again, those policy-held goals move to `recovering` and re-enter scheduler priority ahead of fresh `pending` work.
 - `journal explain` renders recent journal entries as operator-readable transition summaries instead of raw JSONL.
+- `goal note` attaches persisted human context to a goal without changing its lifecycle status.
+- Goal listings now expose note counts, and `goals next` shows the latest note when one exists.
 
 ## oo-bot companion
 

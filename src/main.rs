@@ -61,6 +61,12 @@ enum GoalSubcommand {
         #[arg(long, default_value = "operator_hold")]
         reason: String,
     },
+    Note {
+        goal_id: String,
+        text: String,
+        #[arg(long, default_value = "operator")]
+        author: String,
+    },
     Abort {
         goal_id: String,
         #[arg(long, default_value = "operator_abort")]
@@ -272,11 +278,20 @@ struct Goal {
     status: String,
     #[serde(default)]
     hold_reason: Option<String>,
+    #[serde(default)]
+    notes: Vec<GoalNote>,
     priority: i32,
     created_at_epoch_s: u64,
     updated_at_epoch_s: u64,
     origin: String,
     safety_class: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoalNote {
+    ts_epoch_s: u64,
+    author: String,
+    text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -377,6 +392,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             GoalSubcommand::Hold { goal_id, reason } => {
                 hold_goal(&mut ctx, &goal_id, &reason)?;
                 println!("OK: goal held");
+            }
+            GoalSubcommand::Note {
+                goal_id,
+                text,
+                author,
+            } => {
+                add_goal_note(&mut ctx, &goal_id, &text, &author)?;
+                println!("OK: goal note added");
             }
             GoalSubcommand::Abort { goal_id, reason } => {
                 abort_goal(&mut ctx, &goal_id, &reason)?;
@@ -570,6 +593,7 @@ fn add_goal(
         title: title.clone(),
         status: "pending".to_string(),
         hold_reason: None,
+        notes: Vec::new(),
         priority,
         created_at_epoch_s: now,
         updated_at_epoch_s: now,
@@ -674,6 +698,50 @@ fn hold_goal(
             summary: format!("goal held: {title}"),
             reason: Some(hold_reason),
             action: Some("goal_set_blocked".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
+fn add_goal_note(
+    ctx: &mut RuntimeCtx,
+    goal_id: &str,
+    text: &str,
+    author: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    goal.notes.push(GoalNote {
+        ts_epoch_s: now,
+        author: author.to_string(),
+        text: text.to_string(),
+    });
+    let title = goal.title.clone();
+    let note_preview = truncate_text(text, 80);
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_note".to_string(),
+            severity: "info".to_string(),
+            summary: format!("goal note added: {title} ({note_preview})"),
+            reason: None,
+            action: Some("goal_note_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
         },
@@ -1252,12 +1320,13 @@ fn list_goals(ctx: &RuntimeCtx) {
 
     for goal in &ctx.state.goals {
         println!(
-            "{} | {} | prio={} | {} | hold={} | {}",
+            "{} | {} | prio={} | {} | hold={} | notes={} | {}",
             goal.goal_id,
             goal.status,
             goal.priority,
             goal.origin,
             goal.hold_reason.as_deref().unwrap_or("none"),
+            goal.notes.len(),
             goal.title
         );
     }
@@ -1270,6 +1339,11 @@ fn print_next_goal(ctx: &RuntimeCtx) {
             println!("title        : {}", goal.title);
             println!("status       : {}", goal.status);
             println!("hold_reason  : {}", goal.hold_reason.as_deref().unwrap_or("none"));
+            println!("note_count   : {}", goal.notes.len());
+            if let Some(note) = goal.notes.last() {
+                println!("last_note_by : {}", note.author);
+                println!("last_note    : {}", note.text);
+            }
             println!("priority     : {}", goal.priority);
             println!("origin       : {}", goal.origin);
             println!("safety_class : {}", goal.safety_class);
@@ -1597,6 +1671,11 @@ fn explain_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::
 
 fn explain_event(event: &JournalEvent) -> String {
     match event.kind.as_str() {
+        "goal_note" => format!(
+            "goal note recorded; summary='{}'; action={}",
+            event.summary,
+            event.action.as_deref().unwrap_or("none")
+        ),
         "goal_hold" => format!(
             "operator hold applied; summary='{}'; reason={}",
             event.summary,
@@ -1691,6 +1770,15 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let truncated: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     Ok(serde_json::from_reader(file)?)
@@ -1739,6 +1827,7 @@ mod tests {
             title: title.to_string(),
             status: status.to_string(),
             hold_reason: None,
+            notes: Vec::new(),
             priority,
             created_at_epoch_s,
             updated_at_epoch_s: created_at_epoch_s,
@@ -1902,6 +1991,27 @@ mod tests {
         let text = explain_event(&event);
         assert!(text.contains("governance hold applied"));
         assert!(text.contains("policy_hold"));
+    }
+
+    #[test]
+    fn truncate_text_adds_ellipsis_when_needed() {
+        let text = truncate_text("abcdefghijklmnopqrstuvwxyz", 10);
+        assert_eq!(text, "abcdefghij...");
+    }
+
+    #[test]
+    fn goal_note_can_be_appended_without_state_transition() {
+        let mut goal = goal("g1", "note me", "doing", 1, 1);
+        goal.notes.push(GoalNote {
+            ts_epoch_s: 10,
+            author: "operator".to_string(),
+            text: "remember this".to_string(),
+        });
+
+        assert_eq!(goal.status, "doing");
+        assert_eq!(goal.notes.len(), 1);
+        assert_eq!(goal.notes[0].author, "operator");
+        assert_eq!(goal.notes[0].text, "remember this");
     }
 
     #[test]
