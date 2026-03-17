@@ -16,6 +16,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goal add "first goal"`
 - `cargo run -- goal start <goal-id>`
 - `cargo run -- goal abort <goal-id> --reason operator_abort`
+- `cargo run -- goal resume <goal-id>`
 - `cargo run -- goals list`
 - `cargo run -- goals next`
 - `cargo run -- worker beat clock --role heartbeat`
@@ -31,6 +32,8 @@ Worker health notes:
 - `worker watchdog` runs a small supervision loop and prints per-cycle health and mode results.
 - `tick` applies the same homeostasis logic automatically.
 - When workers go stale, the runtime degrades to `Degraded`; when all known workers recover, it restores to `Normal`.
+- A goal in `doing` becomes `blocked` during worker-health degradation, then moves to `recovering` after health restoration.
+- The scheduler prefers `recovering` goals before new `pending` work, and `goal resume` can also restore a blocked or recovering goal manually.
 
 ## oo-bot companion
 

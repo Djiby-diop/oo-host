@@ -61,6 +61,9 @@ enum GoalSubcommand {
         #[arg(long, default_value = "operator_abort")]
         reason: String,
     },
+    Resume {
+        goal_id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -364,6 +367,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 abort_goal(&mut ctx, &goal_id, &reason)?;
                 println!("OK: goal aborted");
             }
+            GoalSubcommand::Resume { goal_id } => {
+                resume_goal(&mut ctx, &goal_id)?;
+                println!("OK: goal resumed");
+            }
         },
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
@@ -612,6 +619,49 @@ fn mark_goal_done(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std
     Ok(())
 }
 
+fn resume_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    if is_terminal_goal_status(&goal.status) {
+        return Err(format!("goal is terminal: {goal_id}").into());
+    }
+
+    if goal.status != "blocked" && goal.status != "recovering" {
+        return Err(format!("goal is not resumable: {goal_id}").into());
+    }
+
+    goal.status = "doing".to_string();
+    goal.updated_at_epoch_s = now;
+    let title = goal.title.clone();
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_resume".to_string(),
+            severity: "notice".to_string(),
+            summary: format!("goal resumed: {title}"),
+            reason: Some("operator_resume".to_string()),
+            action: Some("goal_resume".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
 fn start_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let now = now_epoch_s();
     let goal = ctx
@@ -621,7 +671,7 @@ fn start_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::er
         .find(|g| g.goal_id == goal_id)
         .ok_or_else(|| format!("goal not found: {goal_id}"))?;
 
-    if goal.status == "done" || goal.status == "aborted" {
+    if is_terminal_goal_status(&goal.status) {
         return Err(format!("goal is terminal: {goal_id}").into());
     }
 
@@ -664,7 +714,7 @@ fn abort_goal(
         .find(|g| g.goal_id == goal_id)
         .ok_or_else(|| format!("goal not found: {goal_id}"))?;
 
-    if goal.status == "done" || goal.status == "aborted" {
+    if is_terminal_goal_status(&goal.status) {
         return Err(format!("goal is terminal: {goal_id}").into());
     }
 
@@ -824,6 +874,27 @@ fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::err
     let now = now_epoch_s();
     let _ = apply_worker_homeostasis(ctx, now)?;
 
+    if matches!(ctx.state.mode, RuntimeMode::Degraded) {
+        append_event(
+            &ctx.paths.journal_path,
+            &JournalEvent {
+                event_id: Uuid::new_v4().to_string(),
+                ts_epoch_s: now,
+                organism_id: ctx.identity.organism_id.clone(),
+                runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                runtime_instance_id: ctx.runtime_instance_id.clone(),
+                kind: "scheduler_tick".to_string(),
+                severity: "warn".to_string(),
+                summary: "scheduler paused while runtime is degraded".to_string(),
+                reason: Some("worker_health_degraded".to_string()),
+                action: Some("tick_pause".to_string()),
+                result: Some("degraded_pause".to_string()),
+                continuity_epoch: ctx.state.continuity_epoch,
+            },
+        )?;
+        return Ok("degraded_pause");
+    }
+
     if let Some(goal) = ctx.state.goals.iter().find(|g| g.status == "doing") {
         let active_title = goal.title.clone();
         append_event(
@@ -846,21 +917,27 @@ fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::err
         return Ok("active_goal_unchanged");
     }
 
-    let next_goal_id = ctx
-        .state
-        .goals
-        .iter()
-        .filter(|g| g.status == "pending")
-        .max_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| b.created_at_epoch_s.cmp(&a.created_at_epoch_s))
-                .then_with(|| b.goal_id.cmp(&a.goal_id))
-        })
-        .map(|g| g.goal_id.clone());
+    let next_goal = select_next_goal(&ctx.state)
+        .filter(|g| g.status == "pending" || g.status == "recovering")
+        .map(|g| (g.goal_id.clone(), g.status.clone(), g.title.clone()));
 
-    if let Some(goal_id) = next_goal_id {
+    if let Some((goal_id, prior_status, goal_title)) = next_goal {
         start_goal(ctx, &goal_id)?;
+        let (summary, reason, action, result) = if prior_status == "recovering" {
+            (
+                format!("scheduler resumed goal: {goal_title}"),
+                "worker_health_restored",
+                "tick_resume_goal",
+                "goal_resumed",
+            )
+        } else {
+            (
+                format!("scheduler activated goal: {goal_id}"),
+                "selected_pending_goal",
+                "tick_start_goal",
+                "goal_started",
+            )
+        };
         append_event(
             &ctx.paths.journal_path,
             &JournalEvent {
@@ -871,14 +948,14 @@ fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::err
                 runtime_instance_id: ctx.runtime_instance_id.clone(),
                 kind: "scheduler_tick".to_string(),
                 severity: "notice".to_string(),
-                summary: format!("scheduler activated goal: {goal_id}"),
-                reason: Some("selected_pending_goal".to_string()),
-                action: Some("tick_start_goal".to_string()),
-                result: Some("goal_started".to_string()),
+                summary,
+                reason: Some(reason.to_string()),
+                action: Some(action.to_string()),
+                result: Some(result.to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
             },
         )?;
-        return Ok("goal_started");
+        return Ok(result);
     }
 
     append_event(
@@ -1111,7 +1188,7 @@ fn select_next_goal(state: &State) -> Option<&Goal> {
     state
         .goals
         .iter()
-        .filter(|g| g.status != "done" && g.status != "aborted")
+        .filter(|g| is_actionable_goal_status(&g.status))
         .max_by(|a, b| {
             goal_selection_rank(&a.status)
                 .cmp(&goal_selection_rank(&b.status))
@@ -1123,10 +1200,19 @@ fn select_next_goal(state: &State) -> Option<&Goal> {
 
 fn goal_selection_rank(status: &str) -> u8 {
     match status {
-        "doing" => 2,
+        "doing" => 3,
+        "recovering" => 2,
         "pending" => 1,
         _ => 0,
     }
+}
+
+fn is_terminal_goal_status(status: &str) -> bool {
+    status == "done" || status == "aborted"
+}
+
+fn is_actionable_goal_status(status: &str) -> bool {
+    status == "doing" || status == "recovering" || status == "pending"
 }
 
 const WORKER_STALE_AFTER_S: u64 = 300;
@@ -1166,8 +1252,28 @@ fn apply_worker_homeostasis(
     let stale_workers = refresh_worker_health(&mut ctx.state, now_epoch_s);
 
     if stale_workers > 0 && !matches!(ctx.state.mode, RuntimeMode::Safe | RuntimeMode::Degraded) {
+        let blocked_goals = block_active_goals(&mut ctx.state, now_epoch_s);
         ctx.state.mode = RuntimeMode::Degraded;
         persist_ctx(ctx)?;
+        for goal_title in blocked_goals {
+            append_event(
+                &ctx.paths.journal_path,
+                &JournalEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    ts_epoch_s: now_epoch_s,
+                    organism_id: ctx.identity.organism_id.clone(),
+                    runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                    runtime_instance_id: ctx.runtime_instance_id.clone(),
+                    kind: "goal_block".to_string(),
+                    severity: "warn".to_string(),
+                    summary: format!("goal blocked: {goal_title}"),
+                    reason: Some("worker_health_degraded".to_string()),
+                    action: Some("goal_set_blocked".to_string()),
+                    result: Some("ok".to_string()),
+                    continuity_epoch: ctx.state.continuity_epoch,
+                },
+            )?;
+        }
         append_event(
             &ctx.paths.journal_path,
             &JournalEvent {
@@ -1189,8 +1295,28 @@ fn apply_worker_homeostasis(
     }
 
     if stale_workers == 0 && !ctx.state.workers.is_empty() && matches!(ctx.state.mode, RuntimeMode::Degraded) {
+        let recovering_goals = recover_blocked_goals(&mut ctx.state, now_epoch_s);
         ctx.state.mode = RuntimeMode::Normal;
         persist_ctx(ctx)?;
+        for goal_title in recovering_goals {
+            append_event(
+                &ctx.paths.journal_path,
+                &JournalEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    ts_epoch_s: now_epoch_s,
+                    organism_id: ctx.identity.organism_id.clone(),
+                    runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                    runtime_instance_id: ctx.runtime_instance_id.clone(),
+                    kind: "goal_recover".to_string(),
+                    severity: "notice".to_string(),
+                    summary: format!("goal recovering: {goal_title}"),
+                    reason: Some("worker_health_restored".to_string()),
+                    action: Some("goal_set_recovering".to_string()),
+                    result: Some("ok".to_string()),
+                    continuity_epoch: ctx.state.continuity_epoch,
+                },
+            )?;
+        }
         append_event(
             &ctx.paths.journal_path,
             &JournalEvent {
@@ -1213,6 +1339,30 @@ fn apply_worker_homeostasis(
 
     persist_ctx(ctx)?;
     Ok(if stale_workers > 0 { "stale_unchanged" } else { "healthy_unchanged" })
+}
+
+fn block_active_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
+    let mut blocked = Vec::new();
+    for goal in &mut state.goals {
+        if goal.status == "doing" || goal.status == "recovering" {
+            goal.status = "blocked".to_string();
+            goal.updated_at_epoch_s = now_epoch_s;
+            blocked.push(goal.title.clone());
+        }
+    }
+    blocked
+}
+
+fn recover_blocked_goals(state: &mut State, now_epoch_s: u64) -> Vec<String> {
+    let mut recovering = Vec::new();
+    for goal in &mut state.goals {
+        if goal.status == "blocked" {
+            goal.status = "recovering".to_string();
+            goal.updated_at_epoch_s = now_epoch_s;
+            recovering.push(goal.title.clone());
+        }
+    }
+    recovering
 }
 
 fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1347,6 +1497,17 @@ mod tests {
     }
 
     #[test]
+    fn next_goal_prefers_recovering_over_pending() {
+        let state = sample_state(vec![
+            goal("g1", "recover me", "recovering", 1, 10),
+            goal("g2", "pending_hi", "pending", 9, 5),
+        ]);
+
+        let next = select_next_goal(&state).expect("expected active goal");
+        assert_eq!(next.goal_id, "g1");
+    }
+
+    #[test]
     fn next_goal_returns_none_when_only_terminal_goals_exist() {
         let state = sample_state(vec![
             goal("g1", "done", "done", 5, 10),
@@ -1359,7 +1520,36 @@ mod tests {
     #[test]
     fn goal_selection_rank_orders_expected_states() {
         assert!(goal_selection_rank("doing") > goal_selection_rank("pending"));
+        assert!(goal_selection_rank("recovering") > goal_selection_rank("pending"));
         assert!(goal_selection_rank("pending") > goal_selection_rank("done"));
+    }
+
+    #[test]
+    fn block_active_goals_moves_doing_and_recovering_to_blocked() {
+        let mut state = sample_state(vec![
+            goal("g1", "doing", "doing", 1, 1),
+            goal("g2", "recovering", "recovering", 1, 2),
+            goal("g3", "pending", "pending", 1, 3),
+        ]);
+
+        let blocked = block_active_goals(&mut state, 99);
+        assert_eq!(blocked.len(), 2);
+        assert_eq!(state.goals[0].status, "blocked");
+        assert_eq!(state.goals[1].status, "blocked");
+        assert_eq!(state.goals[2].status, "pending");
+    }
+
+    #[test]
+    fn recover_blocked_goals_moves_blocked_to_recovering() {
+        let mut state = sample_state(vec![
+            goal("g1", "blocked", "blocked", 1, 1),
+            goal("g2", "pending", "pending", 1, 2),
+        ]);
+
+        let recovering = recover_blocked_goals(&mut state, 100);
+        assert_eq!(recovering.len(), 1);
+        assert_eq!(state.goals[0].status, "recovering");
+        assert_eq!(state.goals[1].status, "pending");
     }
 
     #[test]
