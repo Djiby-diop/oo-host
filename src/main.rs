@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -136,6 +137,10 @@ enum ReportSubcommand {
         out_dir: Option<PathBuf>,
         #[arg(short = 'n', long, default_value_t = 20)]
         journal_count: usize,
+        #[arg(long)]
+        include_sovereign: bool,
+        #[arg(long)]
+        sovereign_workspace: Option<PathBuf>,
     },
 }
 
@@ -472,9 +477,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ReportSubcommand::Daily {
                 out_dir,
                 journal_count,
+                include_sovereign,
+                sovereign_workspace,
             } => {
                 let target_dir = out_dir.unwrap_or_else(|| ctx.paths.data_dir.join("reports").join("daily"));
-                write_daily_reports(&ctx, &target_dir, journal_count)?;
+                write_daily_reports(
+                    &ctx,
+                    &target_dir,
+                    journal_count,
+                    include_sovereign,
+                    sovereign_workspace.as_deref(),
+                )?;
                 println!("OK: daily reports written to {}", target_dir.display());
             }
         },
@@ -1977,6 +1990,8 @@ fn write_daily_reports(
     ctx: &RuntimeCtx,
     out_dir: &Path,
     journal_count: usize,
+    include_sovereign: bool,
+    sovereign_workspace: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let status_path = out_dir.join("status.md");
     let next_goal_path = out_dir.join("next-goal.md");
@@ -1988,7 +2003,87 @@ fn write_daily_reports(
     let events = read_recent_events(&ctx.paths.journal_path, journal_count)?;
     write_text_file(&journal_path, &render_journal_explain_markdown(&events))?;
 
+    if include_sovereign {
+        let workspace = resolve_sovereign_workspace(sovereign_workspace)?;
+        let sovereign_path = out_dir.join("sovereign.md");
+        write_text_file(&sovereign_path, &render_sovereign_summary_markdown(&workspace)?)?;
+    }
+
     Ok(())
+}
+
+fn resolve_sovereign_workspace(override_path: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = override_path {
+        return Ok(path.to_path_buf());
+    }
+
+    let cwd = std::env::current_dir()?;
+    if let Some(parent) = cwd.parent() {
+        return Ok(parent.join("llm-baremetal"));
+    }
+
+    Ok(PathBuf::from("..\\llm-baremetal"))
+}
+
+fn render_sovereign_summary_markdown(workspace: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let readme_path = workspace.join("README.md");
+    let receipt_path = workspace.join("OOHANDOFF.TXT");
+    let handoff_script = workspace.join("test-qemu-handoff.ps1");
+    let smoke_script = workspace.join("llmk-autorun-handoff-smoke.txt");
+    let receipt = read_key_value_file(&receipt_path)?;
+
+    let mut lines = vec![
+        "# sovereign summary".to_string(),
+        String::new(),
+        format!("- workspace: {}", workspace.display()),
+        format!("- present: {}", workspace.exists()),
+        format!("- readme: {}", present_absent(readme_path.exists())),
+        format!("- handoff_receipt: {}", present_absent(receipt_path.exists())),
+        format!("- handoff_script: {}", present_absent(handoff_script.exists())),
+        format!("- handoff_smoke: {}", present_absent(smoke_script.exists())),
+        String::new(),
+        "## receipt".to_string(),
+        String::new(),
+    ];
+
+    if receipt.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for (key, value) in receipt {
+            lines.push(format!("- {}: {}", key, value));
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn read_key_value_file(path: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut values = BTreeMap::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            values.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    Ok(values)
+}
+
+fn present_absent(present: bool) -> &'static str {
+    if present {
+        "present"
+    } else {
+        "missing"
+    }
 }
 
 fn explain_event(event: &JournalEvent) -> String {
@@ -2576,7 +2671,7 @@ mod tests {
         )
         .expect("append event");
 
-        write_daily_reports(&ctx, &report_dir, 20).expect("write daily reports");
+        write_daily_reports(&ctx, &report_dir, 20, false, None).expect("write daily reports");
 
         let status = fs::read_to_string(report_dir.join("status.md")).expect("read status");
         let next_goal = fs::read_to_string(report_dir.join("next-goal.md")).expect("read next-goal");
@@ -2585,6 +2680,47 @@ mod tests {
         assert!(status.contains("# oo-host status"));
         assert!(next_goal.contains("# goal g1") || next_goal.contains("# next goal"));
         assert!(journal.contains("# journal explain"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_sovereign_summary_markdown_contains_receipt_fields() {
+        let dir = env::temp_dir().join(format!("oo-host-sovereign-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create sovereign dir");
+        write_text_file(
+            &dir.join("OOHANDOFF.TXT"),
+            "organism_id=abc\nmode=normal\npolicy_enforcement=observe",
+        )
+        .expect("write receipt");
+
+        let markdown = render_sovereign_summary_markdown(&dir).expect("render sovereign summary");
+        assert!(markdown.contains("# sovereign summary"));
+        assert!(markdown.contains("- handoff_receipt: present"));
+        assert!(markdown.contains("- organism_id: abc"));
+        assert!(markdown.contains("- mode: normal"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_daily_reports_can_include_sovereign_bundle() {
+        let dir = env::temp_dir().join(format!("oo-host-daily-sovereign-{}", Uuid::new_v4()));
+        let report_dir = dir.join("bundle");
+        let sovereign_dir = dir.join("llm-baremetal");
+        let mut ctx = sample_ctx(vec![goal("g1", "inspect me", "pending", 3, 1)]);
+        ctx.paths = AppPaths::new(dir.join("data"));
+
+        fs::create_dir_all(&sovereign_dir).expect("create sovereign dir");
+        write_text_file(&sovereign_dir.join("OOHANDOFF.TXT"), "organism_id=abc\nmode=normal")
+            .expect("write sovereign receipt");
+
+        write_daily_reports(&ctx, &report_dir, 20, true, Some(&sovereign_dir))
+            .expect("write daily reports with sovereign");
+
+        let sovereign = fs::read_to_string(report_dir.join("sovereign.md")).expect("read sovereign");
+        assert!(sovereign.contains("# sovereign summary"));
+        assert!(sovereign.contains("- organism_id: abc"));
 
         let _ = fs::remove_dir_all(&dir);
     }

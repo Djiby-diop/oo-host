@@ -27,6 +27,7 @@ Minimal host-side runtime skeleton for the Operating Organism.
 - `cargo run -- goals inspect <goal-id> --format markdown`
 - `cargo run -- goals inspect <goal-id> --format markdown --out data/goal.md`
 - `cargo run -- report daily --out-dir data/reports/daily`
+- `cargo run -- report daily --include-sovereign --sovereign-workspace ../llm-baremetal`
 - `cargo run -- worker beat clock --role heartbeat`
 - `cargo run -- worker list`
 - `cargo run -- worker watchdog --cycles 5 --interval-ms 1000`
@@ -53,6 +54,7 @@ Worker health notes:
 - `status --format markdown` and `goals inspect --format markdown` produce shareable operator summaries.
 - `--out <file>` writes those summaries directly to a file for handoff or reporting.
 - `report daily` writes a compact operator bundle with `status.md`, `next-goal.md`, and `journal-explain.md`.
+- `report daily --include-sovereign` also writes `sovereign.md` by summarizing the sibling [llm-baremetal](../llm-baremetal) workspace when present.
 
 ## oo-bot companion
 
