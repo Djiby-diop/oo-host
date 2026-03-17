@@ -25,6 +25,7 @@ enum Command {
     Journal(JournalCommand),
     Mode(ModeCommand),
     Policy(PolicyCommand),
+    Tick,
     Recover,
     Export(ExportCommand),
 }
@@ -48,6 +49,14 @@ enum GoalSubcommand {
     },
     Done {
         goal_id: String,
+    },
+    Start {
+        goal_id: String,
+    },
+    Abort {
+        goal_id: String,
+        #[arg(long, default_value = "operator_abort")]
+        reason: String,
     },
 }
 
@@ -309,6 +318,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mark_goal_done(&mut ctx, &goal_id)?;
                 println!("OK: goal done");
             }
+            GoalSubcommand::Start { goal_id } => {
+                start_goal(&mut ctx, &goal_id)?;
+                println!("OK: goal started");
+            }
+            GoalSubcommand::Abort { goal_id, reason } => {
+                abort_goal(&mut ctx, &goal_id, &reason)?;
+                println!("OK: goal aborted");
+            }
         },
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
@@ -331,6 +348,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("OK: policy updated");
             }
         },
+        Command::Tick => {
+            let result = scheduler_tick(&mut ctx)?;
+            println!("tick_result       : {}", result);
+        }
         Command::Recover => {
             recover_state(&mut ctx)?;
             println!("OK: recovery snapshot restored");
@@ -537,6 +558,89 @@ fn mark_goal_done(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std
     Ok(())
 }
 
+fn start_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    if goal.status == "done" || goal.status == "aborted" {
+        return Err(format!("goal is terminal: {goal_id}").into());
+    }
+
+    goal.status = "doing".to_string();
+    goal.updated_at_epoch_s = now;
+    let title = goal.title.clone();
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_start".to_string(),
+            severity: "notice".to_string(),
+            summary: format!("goal started: {title}"),
+            reason: None,
+            action: Some("goal_start".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
+fn abort_goal(
+    ctx: &mut RuntimeCtx,
+    goal_id: &str,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    if goal.status == "done" || goal.status == "aborted" {
+        return Err(format!("goal is terminal: {goal_id}").into());
+    }
+
+    goal.status = "aborted".to_string();
+    goal.updated_at_epoch_s = now;
+    let title = goal.title.clone();
+    let abort_reason = reason.to_string();
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_abort".to_string(),
+            severity: "warn".to_string(),
+            summary: format!("goal aborted: {title}"),
+            reason: Some(abort_reason),
+            action: Some("goal_abort".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
 fn set_mode(ctx: &mut RuntimeCtx, mode: RuntimeMode) -> Result<(), Box<dyn std::error::Error>> {
     let mode_name = mode.as_str().to_string();
     ctx.state.mode = mode;
@@ -615,6 +719,87 @@ fn recover_state(ctx: &mut RuntimeCtx) -> Result<(), Box<dyn std::error::Error>>
         },
     )?;
     Ok(())
+}
+
+fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+
+    if let Some(goal) = ctx.state.goals.iter().find(|g| g.status == "doing") {
+        let active_title = goal.title.clone();
+        append_event(
+            &ctx.paths.journal_path,
+            &JournalEvent {
+                event_id: Uuid::new_v4().to_string(),
+                ts_epoch_s: now,
+                organism_id: ctx.identity.organism_id.clone(),
+                runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                runtime_instance_id: ctx.runtime_instance_id.clone(),
+                kind: "scheduler_tick".to_string(),
+                severity: "info".to_string(),
+                summary: format!("scheduler kept active goal: {active_title}"),
+                reason: Some("active_goal_present".to_string()),
+                action: Some("tick_noop".to_string()),
+                result: Some("active_goal_unchanged".to_string()),
+                continuity_epoch: ctx.state.continuity_epoch,
+            },
+        )?;
+        return Ok("active_goal_unchanged");
+    }
+
+    let next_goal_id = ctx
+        .state
+        .goals
+        .iter()
+        .filter(|g| g.status == "pending")
+        .max_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| b.created_at_epoch_s.cmp(&a.created_at_epoch_s))
+                .then_with(|| b.goal_id.cmp(&a.goal_id))
+        })
+        .map(|g| g.goal_id.clone());
+
+    if let Some(goal_id) = next_goal_id {
+        start_goal(ctx, &goal_id)?;
+        append_event(
+            &ctx.paths.journal_path,
+            &JournalEvent {
+                event_id: Uuid::new_v4().to_string(),
+                ts_epoch_s: now,
+                organism_id: ctx.identity.organism_id.clone(),
+                runtime_habitat: ctx.identity.runtime_habitat.clone(),
+                runtime_instance_id: ctx.runtime_instance_id.clone(),
+                kind: "scheduler_tick".to_string(),
+                severity: "notice".to_string(),
+                summary: format!("scheduler activated goal: {goal_id}"),
+                reason: Some("selected_pending_goal".to_string()),
+                action: Some("tick_start_goal".to_string()),
+                result: Some("goal_started".to_string()),
+                continuity_epoch: ctx.state.continuity_epoch,
+            },
+        )?;
+        return Ok("goal_started");
+    }
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "scheduler_tick".to_string(),
+            severity: "info".to_string(),
+            summary: "scheduler found no pending goals".to_string(),
+            reason: Some("no_pending_goals".to_string()),
+            action: Some("tick_noop".to_string()),
+            result: Some("idle".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok("idle")
 }
 
 fn export_sovereign(ctx: &RuntimeCtx, out_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -777,11 +962,20 @@ fn select_next_goal(state: &State) -> Option<&Goal> {
         .iter()
         .filter(|g| g.status != "done" && g.status != "aborted")
         .max_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
+            goal_selection_rank(&a.status)
+                .cmp(&goal_selection_rank(&b.status))
+                .then_with(|| a.priority.cmp(&b.priority))
                 .then_with(|| b.created_at_epoch_s.cmp(&a.created_at_epoch_s))
                 .then_with(|| b.goal_id.cmp(&a.goal_id))
         })
+}
+
+fn goal_selection_rank(status: &str) -> u8 {
+    match status {
+        "doing" => 2,
+        "pending" => 1,
+        _ => 0,
+    }
 }
 
 fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -904,6 +1098,17 @@ mod tests {
     }
 
     #[test]
+    fn next_goal_prefers_doing_over_pending() {
+        let state = sample_state(vec![
+            goal("g1", "active", "doing", 1, 10),
+            goal("g2", "pending_hi", "pending", 9, 5),
+        ]);
+
+        let next = select_next_goal(&state).expect("expected active goal");
+        assert_eq!(next.goal_id, "g1");
+    }
+
+    #[test]
     fn next_goal_returns_none_when_only_terminal_goals_exist() {
         let state = sample_state(vec![
             goal("g1", "done", "done", 5, 10),
@@ -911,5 +1116,11 @@ mod tests {
         ]);
 
         assert!(select_next_goal(&state).is_none());
+    }
+
+    #[test]
+    fn goal_selection_rank_orders_expected_states() {
+        assert!(goal_selection_rank("doing") > goal_selection_rank("pending"));
+        assert!(goal_selection_rank("pending") > goal_selection_rank("done"));
     }
 }
