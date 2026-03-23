@@ -51,6 +51,7 @@ pub fn beat_worker(
             action: Some("worker_beat".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -158,6 +159,7 @@ pub fn apply_worker_homeostasis(
                     action: Some("goal_set_blocked".to_string()),
                     result: Some("ok".to_string()),
                     continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
                 },
             )?;
         }
@@ -176,6 +178,7 @@ pub fn apply_worker_homeostasis(
                 action: Some("mode_set_degraded".to_string()),
                 result: Some("ok".to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
             },
         )?;
         return Ok("mode_degraded");
@@ -201,6 +204,7 @@ pub fn apply_worker_homeostasis(
                     action: Some("goal_set_recovering".to_string()),
                     result: Some("ok".to_string()),
                     continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
                 },
             )?;
         }
@@ -219,6 +223,7 @@ pub fn apply_worker_homeostasis(
                 action: Some("mode_set_normal".to_string()),
                 result: Some("ok".to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
             },
         )?;
         return Ok("mode_restored");
@@ -273,6 +278,7 @@ mod tests {
             policy: default_policy_state(),
             workers: Vec::new(),
             goals,
+            federation: Vec::new(),
         }
     }
 
@@ -289,6 +295,7 @@ mod tests {
             updated_at_epoch_s: created_at_epoch_s,
             origin: "test".to_string(),
             safety_class: "normal".to_string(),
+            delegated_to: None,
         }
     }
 

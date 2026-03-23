@@ -32,6 +32,7 @@ pub fn bootstrap(data_dir: PathBuf) -> Result<RuntimeCtx, Box<dyn std::error::Er
             action: Some("bootstrap".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -78,6 +79,7 @@ pub fn load_or_create_state(path: &Path) -> Result<State, Box<dyn std::error::Er
         },
         workers: Vec::new(),
         goals: Vec::new(),
+            federation: Vec::new(),
     };
     write_json(path, &state)?;
     Ok(state)
@@ -126,6 +128,7 @@ pub fn recover_state(ctx: &mut RuntimeCtx) -> Result<(), Box<dyn std::error::Err
             action: Some("recovery_restore".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
     Ok(())

@@ -23,6 +23,7 @@ pub fn set_mode(ctx: &mut RuntimeCtx, mode: RuntimeMode) -> Result<(), Box<dyn s
             action: Some("mode_set".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
     Ok(())
@@ -50,6 +51,7 @@ pub fn set_policy_enforcement(
             action: Some("policy_set".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
     Ok(())
@@ -93,6 +95,7 @@ pub fn apply_policy_homeostasis(
                         action: Some("goal_set_blocked".to_string()),
                         result: Some("ok".to_string()),
                         continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
                     },
                 )?;
             }
@@ -122,6 +125,7 @@ pub fn apply_policy_homeostasis(
                     action: Some("goal_set_recovering".to_string()),
                     result: Some("ok".to_string()),
                     continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
                 },
             )?;
         }
@@ -175,6 +179,7 @@ mod tests {
             policy: default_policy_state(),
             workers: Vec::new(),
             goals,
+            federation: Vec::new(),
         }
     }
 
@@ -191,6 +196,7 @@ mod tests {
             updated_at_epoch_s: created_at_epoch_s,
             origin: "test".to_string(),
             safety_class: "normal".to_string(),
+            delegated_to: None,
         }
     }
 

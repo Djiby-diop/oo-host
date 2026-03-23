@@ -266,6 +266,7 @@ pub fn rotate_journal(
             action: None,
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -292,6 +293,7 @@ mod tests {
             action: Some("mode_set_degraded".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         };
         let text = explain_event(&event);
         assert!(text.contains("worker health transition"));
@@ -314,6 +316,7 @@ mod tests {
             action: Some("goal_set_blocked".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         };
         let text = explain_event(&event);
         assert!(text.contains("governance hold applied"));
@@ -335,6 +338,7 @@ mod tests {
             action: Some("mode_set_degraded".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         }];
         let markdown = render_journal_explain_markdown(&events);
         assert!(markdown.contains("# journal explain"));
@@ -356,6 +360,7 @@ mod tests {
             updated_at_epoch_s: 1,
             origin: "test".to_string(),
             safety_class: "normal".to_string(),
+            delegated_to: None,
         };
         let by_title = JournalEvent {
             event_id: "e1".to_string(),
@@ -370,6 +375,7 @@ mod tests {
             action: Some("goal_note_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         };
         let by_id = JournalEvent {
             event_id: "e2".to_string(),
@@ -384,6 +390,7 @@ mod tests {
             action: Some("tick_start_goal".to_string()),
             result: Some("goal_started".to_string()),
             continuity_epoch: 0,
+            signature: None,
         };
         let other = JournalEvent {
             event_id: "e3".to_string(),
@@ -398,6 +405,7 @@ mod tests {
             action: Some("goal_note_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         };
         assert!(event_mentions_goal(&by_title, &goal));
         assert!(event_mentions_goal(&by_id, &goal));
@@ -418,6 +426,7 @@ mod tests {
             action: None,
             result: None,
             continuity_epoch: 0,
+            signature: None,
         }
     }
 
@@ -539,6 +548,7 @@ mod tests {
                 },
                 workers: vec![],
                 goals: vec![],
+            federation: Vec::new(),
             },
             runtime_instance_id: "r1".to_string(),
         };

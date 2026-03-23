@@ -287,6 +287,8 @@ struct Goal {
 	updated_at_epoch_s: u64,
 	origin: String,
 	safety_class: String,
+	#[serde(default)]
+	delegated_to: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -317,6 +319,8 @@ struct JournalEvent {
 	action: Option<String>,
 	result: Option<String>,
 	continuity_epoch: u64,
+	#[serde(default)]
+	signature: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2834,6 +2838,7 @@ mod tests {
 					updated_at_epoch_s: 2,
 					origin: "test".to_string(),
 					safety_class: "normal".to_string(),
+            delegated_to: None,
 				}],
 			},
 			recent_events: vec![JournalEvent {
@@ -2849,6 +2854,7 @@ mod tests {
 				action: Some("bootstrap".to_string()),
 				result: Some("ok".to_string()),
 				continuity_epoch: 0,
+            signature: None,
 			}],
 			sovereign_export: None,
 		}

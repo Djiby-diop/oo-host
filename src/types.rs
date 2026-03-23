@@ -102,6 +102,8 @@ pub struct State {
     #[serde(default)]
     pub workers: Vec<WorkerState>,
     pub goals: Vec<Goal>,
+    #[serde(default)]
+    pub federation: Vec<FederationPeer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +133,8 @@ pub struct Goal {
     pub updated_at_epoch_s: u64,
     pub origin: String,
     pub safety_class: String,
+    #[serde(default)]
+    pub delegated_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +158,8 @@ pub struct JournalEvent {
     pub action: Option<String>,
     pub result: Option<String>,
     pub continuity_epoch: u64,
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,4 +222,14 @@ pub struct SyncMismatch {
     pub field: String,
     pub host_value: String,
     pub receipt_value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationPeer {
+    pub peer_id: String,
+    pub habitat: String,
+    pub label: Option<String>,
+    pub last_seen_epoch_s: u64,
+    pub last_export_path: Option<String>,
+    pub status: String,
 }

@@ -357,6 +357,7 @@ mod tests {
             policy: default_policy_state(),
             workers: Vec::new(),
             goals,
+            federation: Vec::new(),
         }
     }
 
@@ -373,6 +374,7 @@ mod tests {
             updated_at_epoch_s: created_at_epoch_s,
             origin: "test".to_string(),
             safety_class: "normal".to_string(),
+            delegated_to: None,
         }
     }
 
@@ -432,6 +434,7 @@ mod tests {
                 action: Some("goal_note_add".to_string()),
                 result: Some("ok".to_string()),
                 continuity_epoch: 0,
+            signature: None,
             },
         ).expect("append event");
         write_daily_reports(&ctx, &report_dir, 20, false, false, None).expect("write daily reports");

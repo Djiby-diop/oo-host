@@ -147,11 +147,11 @@ difficult to repudiate in a dispute.
 
 ### v2 — Distributed continuity
 
-- [ ] Multi-host organism federation (same organism_id, different habitats)
-- [ ] Cross-host journal merge with conflict resolution
-- [ ] Autonomous goal delegation to sibling hosts
-- [ ] Cryptographically signed journal entries
-- [ ] Web dashboard for real-time organism status
+- [x] Multi-host organism federation (same organism_id, different habitats)
+- [x] Cross-host journal merge with conflict resolution
+- [x] Autonomous goal delegation to sibling hosts
+- [x] Cryptographically signed journal entries
+- [x] Web dashboard for real-time organism status
 
 ## Relationship to `llm-baremetal`
 
@@ -181,3 +181,56 @@ New features should fit this constraint unless there is a compelling operational
 
 Tests live alongside the code in `#[cfg(test)] mod tests` blocks.
 Every new function should have at least one unit test before merge.
+
+## HTTP Status API
+
+When `oo-host serve` is running, the following HTTP routes are available:
+
+| Route | Method | Response |
+|-------|--------|----------|
+| `/health` | GET | `{"ok":true}` — always 200 |
+| `/status` | GET | JSON: organism_id, mode, policy enforcement, continuity_epoch, goal counts by status, worker count |
+| `/goals` | GET | JSON array of all goals (id, title, status, priority, tags, delegated_to) |
+| any other | GET | `{"error":"not found"}` — 404 |
+
+Start the server with:
+```
+oo-host serve [--port <port>] [--bind <addr>]
+```
+Default: `127.0.0.1:8080`. The server runs until Ctrl-C and uses no dependencies beyond `std`.
+
+## Federation
+
+The organism can track sibling host nodes sharing the same organism through the federation layer.
+
+### Peer model
+
+Each `FederationPeer` records:
+- `peer_id` — UUID matching the peer's `organism_id`
+- `habitat` — runtime environment (e.g. `host_linux`, `host_windows`)
+- `label` — optional human name
+- `last_seen_epoch_s` — Unix timestamp of last contact
+- `last_export_path` — path to the last imported sovereign export from this peer
+- `status` — `"active"` (seen within 24h) or `"stale"` (not seen within 24h)
+
+### Commands
+
+```
+oo-host federation list
+oo-host federation register <peer_id> --habitat <habitat> [--label <label>]
+oo-host federation import <export_path>
+```
+
+Registering or importing a peer emits a journal event (`federation_peer_register` / `federation_import`).
+
+### Goal delegation
+
+Goals can be delegated to a peer for tracking purposes:
+
+```
+oo-host goal delegate <goal_id> --peer <peer_id>
+oo-host goal recall <goal_id>
+```
+
+These emit `goal_delegate` / `goal_recall` journal events. The `delegated_to` field is visible in
+`goals list` and `goals inspect` output.

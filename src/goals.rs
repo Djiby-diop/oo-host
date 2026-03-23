@@ -25,6 +25,7 @@ pub fn add_goal(
         updated_at_epoch_s: now,
         origin,
         safety_class: safety,
+        delegated_to: None,
     };
 
     ctx.state.goals.push(goal);
@@ -45,6 +46,7 @@ pub fn add_goal(
             action: Some("goal_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -81,6 +83,7 @@ pub fn mark_goal_done(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn
             action: Some("goal_done".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -126,6 +129,7 @@ pub fn hold_goal(
             action: Some("goal_set_blocked".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -170,6 +174,7 @@ pub fn add_goal_note(
             action: Some("goal_note_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -214,6 +219,7 @@ pub fn resume_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn st
             action: Some("goal_resume".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -254,6 +260,7 @@ pub fn start_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std
             action: Some("goal_start".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -299,6 +306,7 @@ pub fn abort_goal(
             action: Some("goal_abort".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -337,6 +345,7 @@ pub fn delete_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn st
             action: Some("goal_delete".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -374,6 +383,7 @@ pub fn tag_goal(ctx: &mut RuntimeCtx, goal_id: &str, tag: &str) -> Result<(), Bo
             action: Some("goal_tag_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -409,6 +419,7 @@ pub fn untag_goal(ctx: &mut RuntimeCtx, goal_id: &str, tag: &str) -> Result<(), 
             action: Some("goal_tag_remove".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
@@ -428,7 +439,7 @@ pub fn list_goals(ctx: &RuntimeCtx) {
             goal.tags.join(",")
         };
         println!(
-            "{} | {} | prio={} | {} | hold={} | notes={} | tags={} | {}",
+            "{} | {} | prio={} | {} | hold={} | notes={} | tags={} | delegated_to={} | {}",
             goal.goal_id,
             goal.status,
             goal.priority,
@@ -436,6 +447,7 @@ pub fn list_goals(ctx: &RuntimeCtx) {
             goal.hold_reason.as_deref().unwrap_or("none"),
             goal.notes.len(),
             tags_str,
+            goal.delegated_to.as_deref().unwrap_or("none"),
             goal.title
         );
     }
@@ -503,6 +515,7 @@ pub fn render_goal_inspect_text(goal: &Goal, related_events: &[JournalEvent]) ->
         format!("origin        : {}", goal.origin),
         format!("safety_class  : {}", goal.safety_class),
         format!("tags          : {}", tags_str),
+        format!("delegated_to  : {}", goal.delegated_to.as_deref().unwrap_or("none")),
         format!("created_at    : {}", goal.created_at_epoch_s),
         format!("updated_at    : {}", goal.updated_at_epoch_s),
         format!("note_count    : {}", goal.notes.len()),
@@ -550,6 +563,7 @@ pub fn render_goal_inspect_markdown(goal: &Goal, related_events: &[JournalEvent]
         format!("- origin: {}", goal.origin),
         format!("- safety_class: {}", goal.safety_class),
         format!("- tags: {}", tags_str),
+        format!("- delegated_to: {}", goal.delegated_to.as_deref().unwrap_or("none")),
         format!("- created_at: {}", goal.created_at_epoch_s),
         format!("- updated_at: {}", goal.updated_at_epoch_s),
         format!("- note_count: {}", goal.notes.len()),
@@ -629,6 +643,78 @@ pub fn is_policy_safe_goal(goal: &Goal) -> bool {
     goal.safety_class == "normal"
 }
 
+pub fn delegate_goal(ctx: &mut RuntimeCtx, goal_id: &str, peer_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    goal.delegated_to = Some(peer_id.to_string());
+    goal.updated_at_epoch_s = now;
+    let title = goal.title.clone();
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_delegate".to_string(),
+            severity: "info".to_string(),
+            summary: format!("goal delegated: {title} -> {peer_id}"),
+            reason: None,
+            action: Some("goal_delegate".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
+        },
+    )?;
+
+    Ok(())
+}
+
+pub fn recall_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    goal.delegated_to = None;
+    goal.updated_at_epoch_s = now;
+    let title = goal.title.clone();
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_recall".to_string(),
+            severity: "info".to_string(),
+            summary: format!("goal recalled: {title}"),
+            reason: None,
+            action: Some("goal_recall".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
+        },
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +732,7 @@ mod tests {
             policy: default_policy_state(),
             workers: Vec::new(),
             goals,
+            federation: Vec::new(),
         }
     }
 
@@ -662,6 +749,7 @@ mod tests {
             updated_at_epoch_s: created_at_epoch_s,
             origin: "test".to_string(),
             safety_class: "normal".to_string(),
+            delegated_to: None,
         }
     }
 
@@ -757,6 +845,7 @@ mod tests {
             action: Some("goal_note_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         }];
         let markdown = render_goal_inspect_markdown(&g, &events);
         assert!(markdown.contains("# goal g1"));
@@ -787,6 +876,7 @@ mod tests {
             action: Some("goal_note_add".to_string()),
             result: Some("ok".to_string()),
             continuity_epoch: 0,
+            signature: None,
         }];
         let text = render_goal_inspect_text(&g, &events);
         assert!(text.contains("goal_id       : g1"));
@@ -855,5 +945,25 @@ mod tests {
             g.notes.len(), tags_str, g.title
         );
         assert!(line.contains("tags=important"));
+    }
+
+    #[test]
+    fn delegate_goal_sets_delegated_to() {
+        let mut g = goal("g1", "do thing", "doing", 1, 1);
+        assert!(g.delegated_to.is_none());
+        g.delegated_to = Some("peer-123".to_string());
+        assert_eq!(g.delegated_to.as_deref(), Some("peer-123"));
+        // Status unchanged
+        assert_eq!(g.status, "doing");
+    }
+
+    #[test]
+    fn recall_goal_clears_delegated_to() {
+        let mut g = goal("g1", "do thing", "doing", 1, 1);
+        g.delegated_to = Some("peer-123".to_string());
+        g.delegated_to = None;
+        assert!(g.delegated_to.is_none());
+        // Status unchanged
+        assert_eq!(g.status, "doing");
     }
 }

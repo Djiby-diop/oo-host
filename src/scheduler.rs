@@ -26,6 +26,7 @@ pub fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std:
                 action: Some("tick_pause".to_string()),
                 result: Some("policy_pause".to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
             },
         )?;
         return Ok("policy_pause");
@@ -47,6 +48,7 @@ pub fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std:
                 action: Some("tick_pause".to_string()),
                 result: Some("degraded_pause".to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
             },
         )?;
         return Ok("degraded_pause");
@@ -69,6 +71,7 @@ pub fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std:
                 action: Some("tick_noop".to_string()),
                 result: Some("active_goal_unchanged".to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
             },
         )?;
         return Ok("active_goal_unchanged");
@@ -110,6 +113,7 @@ pub fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std:
                 action: Some(action.to_string()),
                 result: Some(result.to_string()),
                 continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
             },
         )?;
         return Ok(result);
@@ -130,6 +134,7 @@ pub fn scheduler_tick(ctx: &mut RuntimeCtx) -> Result<&'static str, Box<dyn std:
             action: Some("tick_noop".to_string()),
             result: Some("idle".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 

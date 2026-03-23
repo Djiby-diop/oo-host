@@ -1,10 +1,13 @@
 mod export;
+mod federation;
 mod goals;
 mod io;
 mod journal;
 mod policy;
 mod reports;
 mod scheduler;
+mod serve;
+mod signing;
 mod state;
 mod types;
 mod workers;
@@ -14,15 +17,19 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use export::export_sovereign;
+use federation::{import_peer_export, list_peers, register_peer};
 use goals::{
-    abort_goal, add_goal, add_goal_note, delete_goal, hold_goal, inspect_goal, list_goals,
-    mark_goal_done, print_next_goal, resume_goal, start_goal, tag_goal, untag_goal,
+    abort_goal, add_goal, add_goal_note, delegate_goal, delete_goal, hold_goal, inspect_goal,
+    list_goals, mark_goal_done, print_next_goal, recall_goal, resume_goal, start_goal, tag_goal,
+    untag_goal,
 };
 use io::{append_event, now_epoch_s};
 use journal::{explain_journal, rotate_journal, search_journal, tail_journal};
 use policy::{print_mode, print_policy, set_mode, set_policy_enforcement};
 use reports::{print_status, write_daily_reports};
 use scheduler::scheduler_tick;
+use serve::run_server;
+use signing::{sign_event, verify_event};
 use state::{bootstrap, recover_state, save_recovery_snapshot, save_state};
 use types::{JournalEvent, OutputFormat, PolicyEnforcement, RuntimeMode};
 use workers::{beat_worker, list_workers, run_worker_watchdog};
@@ -51,6 +58,8 @@ enum Command {
     Tick,
     Recover,
     Export(ExportCommand),
+    Federation(FederationCommand),
+    Serve(ServeCommand),
 }
 
 #[derive(Args, Debug)]
@@ -114,6 +123,14 @@ enum GoalSubcommand {
         goal_id: String,
         tag: String,
     },
+    Delegate {
+        goal_id: String,
+        #[arg(long)]
+        peer: String,
+    },
+    Recall {
+        goal_id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -174,6 +191,18 @@ enum JournalSubcommand {
         max_lines: usize,
         #[arg(long, default_value_t = 2000)]
         keep: usize,
+    },
+    Sign {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
+        #[arg(long)]
+        key: PathBuf,
+    },
+    Verify {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
+        #[arg(long)]
+        key: PathBuf,
     },
 }
 
@@ -261,6 +290,35 @@ enum ExportSubcommand {
     },
 }
 
+#[derive(Args, Debug)]
+struct FederationCommand {
+    #[command(subcommand)]
+    command: FederationSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum FederationSubcommand {
+    List,
+    Register {
+        peer_id: String,
+        #[arg(long)]
+        habitat: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    Import {
+        export_path: PathBuf,
+    },
+}
+
+#[derive(Args, Debug)]
+struct ServeCommand {
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mut ctx = bootstrap(cli.data_dir)?;
@@ -317,6 +375,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 untag_goal(&mut ctx, &goal_id, &tag)?;
                 println!("OK: goal tag removed");
             }
+            GoalSubcommand::Delegate { goal_id, peer } => {
+                delegate_goal(&mut ctx, &goal_id, &peer)?;
+                println!("OK: goal delegated to {peer}");
+            }
+            GoalSubcommand::Recall { goal_id } => {
+                recall_goal(&mut ctx, &goal_id)?;
+                println!("OK: goal recalled");
+            }
         },
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
@@ -342,6 +408,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             JournalSubcommand::Rotate { max_lines, keep } => {
                 rotate_journal(&ctx, max_lines, keep)?;
+            }
+            JournalSubcommand::Sign { count, key } => {
+                let events = io::read_recent_events(&ctx.paths.journal_path, count)?;
+                let unsigned: Vec<_> = events.into_iter().filter(|e| e.signature.is_none()).collect();
+                let n = unsigned.len();
+                // Rewrite entire journal: re-read all, replace unsigned ones with signed versions
+                let all_events = io::read_all_events(&ctx.paths.journal_path)?;
+                let unsigned_ids: std::collections::HashSet<String> =
+                    unsigned.iter().map(|e| e.event_id.clone()).collect();
+                let mut signed_events: Vec<types::JournalEvent> = Vec::new();
+                for mut event in all_events {
+                    if unsigned_ids.contains(&event.event_id) {
+                        sign_event(&mut event, &key)?;
+                    }
+                    signed_events.push(event);
+                }
+                {
+                    use std::io::Write as _;
+                    let tmp = ctx.paths.journal_path.with_extension("tmp");
+                    let mut f = std::fs::File::create(&tmp)?;
+                    for e in &signed_events {
+                        serde_json::to_writer(&mut f, e)?;
+                        f.write_all(b"\n")?;
+                    }
+                    std::fs::rename(tmp, &ctx.paths.journal_path)?;
+                }
+                println!("OK: {n} events signed");
+            }
+            JournalSubcommand::Verify { count, key } => {
+                let events = io::read_recent_events(&ctx.paths.journal_path, count)?;
+                for event in &events {
+                    let result = if event.signature.is_none() {
+                        "unsigned".to_string()
+                    } else {
+                        match verify_event(event, &key) {
+                            Ok(true) => "OK".to_string(),
+                            Ok(false) => "INVALID".to_string(),
+                            Err(e) => format!("ERROR: {e}"),
+                        }
+                    };
+                    println!("[{}] {} | {}", event.ts_epoch_s, event.kind, result);
+                }
             }
         },
         Command::Report(report) => match report.command {
@@ -409,6 +517,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("OK: sovereign export written to {}", out_path.display());
             }
         },
+        Command::Federation(fed) => match fed.command {
+            FederationSubcommand::List => list_peers(&ctx),
+            FederationSubcommand::Register { peer_id, habitat, label } => {
+                register_peer(&mut ctx, &peer_id, &habitat, label.as_deref())?;
+                println!("OK: peer {peer_id} registered");
+            }
+            FederationSubcommand::Import { export_path } => {
+                import_peer_export(&mut ctx, &export_path)?;
+            }
+        },
+        Command::Serve(serve) => {
+            // Save state before entering server loop (clean shutdown already set to true)
+            ctx.state.last_clean_shutdown = true;
+            save_state(&ctx.paths.state_path, &ctx.state)?;
+            save_recovery_snapshot(&ctx.paths.recovery_path, &ctx.state)?;
+            run_server(ctx, &serve.bind, serve.port)?;
+            return Ok(());
+        }
     }
 
     ctx.state.last_clean_shutdown = true;
@@ -429,6 +555,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             action: None,
             result: Some("clean_shutdown".to_string()),
             continuity_epoch: ctx.state.continuity_epoch,
+            signature: None,
         },
     )?;
 
