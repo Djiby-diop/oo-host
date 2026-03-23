@@ -12,6 +12,7 @@ pub fn beat_worker(
     worker_id: &str,
     role: &str,
     summary: &str,
+    stale_after: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now = now_epoch_s();
     if let Some(worker) = ctx.state.workers.iter_mut().find(|w| w.worker_id == worker_id) {
@@ -19,6 +20,9 @@ pub fn beat_worker(
         worker.status = "alive".to_string();
         worker.last_heartbeat_epoch_s = now;
         worker.heartbeat_count += 1;
+        if stale_after.is_some() {
+            worker.stale_after_s = stale_after;
+        }
     } else {
         ctx.state.workers.push(WorkerState {
             worker_id: worker_id.to_string(),
@@ -26,6 +30,7 @@ pub fn beat_worker(
             status: "alive".to_string(),
             last_heartbeat_epoch_s: now,
             heartbeat_count: 1,
+            stale_after_s: stale_after,
         });
     }
 
@@ -99,7 +104,8 @@ pub fn run_worker_watchdog(
 }
 
 pub fn effective_worker_status(worker: &WorkerState, now_epoch_s: u64) -> &'static str {
-    if now_epoch_s.saturating_sub(worker.last_heartbeat_epoch_s) > WORKER_STALE_AFTER_S {
+    let threshold = worker.stale_after_s.unwrap_or(WORKER_STALE_AFTER_S);
+    if now_epoch_s.saturating_sub(worker.last_heartbeat_epoch_s) > threshold {
         "stale"
     } else {
         "alive"
@@ -277,6 +283,7 @@ mod tests {
             status: status.to_string(),
             hold_reason: None,
             notes: Vec::new(),
+            tags: Vec::new(),
             priority,
             created_at_epoch_s,
             updated_at_epoch_s: created_at_epoch_s,
@@ -341,6 +348,7 @@ mod tests {
             status: "alive".to_string(),
             last_heartbeat_epoch_s: 10,
             heartbeat_count: 1,
+            stale_after_s: None,
         });
         let stale = refresh_worker_health(&mut state, 10 + WORKER_STALE_AFTER_S + 1);
         assert_eq!(stale, 1);
@@ -356,6 +364,7 @@ mod tests {
             status: "unknown".to_string(),
             last_heartbeat_epoch_s: 100,
             heartbeat_count: 2,
+            stale_after_s: None,
         });
         let stale = refresh_worker_health(&mut state, 100 + WORKER_STALE_AFTER_S);
         assert_eq!(stale, 0);
@@ -371,6 +380,7 @@ mod tests {
             status: "alive".to_string(),
             last_heartbeat_epoch_s: 1,
             heartbeat_count: 1,
+            stale_after_s: None,
         });
         state.workers.push(WorkerState {
             worker_id: "w2".to_string(),
@@ -378,7 +388,24 @@ mod tests {
             status: "alive".to_string(),
             last_heartbeat_epoch_s: 1 + WORKER_STALE_AFTER_S + 5,
             heartbeat_count: 1,
+            stale_after_s: None,
         });
         assert_eq!(count_stale_workers(&state, 1 + WORKER_STALE_AFTER_S + 10), 1);
+    }
+
+    #[test]
+    fn effective_worker_status_uses_custom_stale_after_s() {
+        let worker = WorkerState {
+            worker_id: "w1".to_string(),
+            role: "fast".to_string(),
+            status: "alive".to_string(),
+            last_heartbeat_epoch_s: 100,
+            heartbeat_count: 1,
+            stale_after_s: Some(60),
+        };
+        // 61 seconds later — should be stale with custom threshold of 60s
+        assert_eq!(effective_worker_status(&worker, 161), "stale");
+        // 60 seconds later — not yet stale
+        assert_eq!(effective_worker_status(&worker, 160), "alive");
     }
 }

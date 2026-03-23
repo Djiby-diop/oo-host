@@ -15,11 +15,11 @@ use uuid::Uuid;
 
 use export::export_sovereign;
 use goals::{
-    abort_goal, add_goal, add_goal_note, hold_goal, inspect_goal, list_goals, mark_goal_done,
-    print_next_goal, resume_goal, start_goal,
+    abort_goal, add_goal, add_goal_note, delete_goal, hold_goal, inspect_goal, list_goals,
+    mark_goal_done, print_next_goal, resume_goal, start_goal, tag_goal, untag_goal,
 };
 use io::{append_event, now_epoch_s};
-use journal::{explain_journal, tail_journal};
+use journal::{explain_journal, search_journal, tail_journal};
 use policy::{print_mode, print_policy, set_mode, set_policy_enforcement};
 use reports::{print_status, write_daily_reports};
 use scheduler::scheduler_tick;
@@ -103,6 +103,17 @@ enum GoalSubcommand {
     Resume {
         goal_id: String,
     },
+    Delete {
+        goal_id: String,
+    },
+    Tag {
+        goal_id: String,
+        tag: String,
+    },
+    Untag {
+        goal_id: String,
+        tag: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -144,6 +155,18 @@ enum JournalSubcommand {
     },
     Explain {
         #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
+    },
+    Search {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        severity: Option<String>,
+        #[arg(long)]
+        since: Option<u64>,
+        #[arg(long)]
+        until: Option<u64>,
+        #[arg(short = 'n', long, default_value_t = 50)]
         count: usize,
     },
 }
@@ -199,6 +222,8 @@ enum WorkerSubcommand {
         role: String,
         #[arg(long, default_value = "heartbeat")]
         summary: String,
+        #[arg(long)]
+        stale_after: Option<u64>,
     },
     Watchdog {
         #[arg(long, default_value_t = 3)]
@@ -274,6 +299,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resume_goal(&mut ctx, &goal_id)?;
                 println!("OK: goal resumed");
             }
+            GoalSubcommand::Delete { goal_id } => {
+                delete_goal(&mut ctx, &goal_id)?;
+                println!("OK: goal deleted");
+            }
+            GoalSubcommand::Tag { goal_id, tag } => {
+                tag_goal(&mut ctx, &goal_id, &tag)?;
+                println!("OK: goal tag added");
+            }
+            GoalSubcommand::Untag { goal_id, tag } => {
+                untag_goal(&mut ctx, &goal_id, &tag)?;
+                println!("OK: goal tag removed");
+            }
         },
         Command::Goals(goals) => match goals.command {
             GoalsSubcommand::List => list_goals(&ctx),
@@ -287,6 +324,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Journal(journal) => match journal.command {
             JournalSubcommand::Tail { count } => tail_journal(&ctx.paths.journal_path, count)?,
             JournalSubcommand::Explain { count } => explain_journal(&ctx.paths.journal_path, count)?,
+            JournalSubcommand::Search { kind, severity, since, until, count } => {
+                search_journal(
+                    &ctx.paths.journal_path,
+                    kind.as_deref(),
+                    severity.as_deref(),
+                    since,
+                    until,
+                    count,
+                )?;
+            }
         },
         Command::Report(report) => match report.command {
             ReportSubcommand::Daily {
@@ -328,8 +375,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 worker_id,
                 role,
                 summary,
+                stale_after,
             } => {
-                beat_worker(&mut ctx, &worker_id, &role, &summary)?;
+                beat_worker(&mut ctx, &worker_id, &role, &summary, stale_after)?;
                 println!("OK: worker heartbeat recorded");
             }
             WorkerSubcommand::Watchdog {

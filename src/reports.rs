@@ -367,6 +367,7 @@ mod tests {
             status: status.to_string(),
             hold_reason: None,
             notes: Vec::new(),
+            tags: Vec::new(),
             priority,
             created_at_epoch_s,
             updated_at_epoch_s: created_at_epoch_s,

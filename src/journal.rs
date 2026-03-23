@@ -40,6 +40,52 @@ pub fn explain_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+pub fn search_journal(
+    path: &Path,
+    kind: Option<&str>,
+    severity: Option<&str>,
+    since: Option<u64>,
+    until: Option<u64>,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let all = read_all_events(path)?;
+    if all.is_empty() {
+        println!("Journal is empty.");
+        return Ok(());
+    }
+
+    let filtered: Vec<&JournalEvent> = all
+        .iter()
+        .filter(|e| {
+            if let Some(k) = kind { if e.kind != k { return false; } }
+            if let Some(s) = severity { if e.severity != s { return false; } }
+            if let Some(since_s) = since { if e.ts_epoch_s < since_s { return false; } }
+            if let Some(until_s) = until { if e.ts_epoch_s > until_s { return false; } }
+            true
+        })
+        .collect();
+
+    let start = filtered.len().saturating_sub(count);
+    let page = &filtered[start..];
+
+    if page.is_empty() {
+        println!("No matching events.");
+        return Ok(());
+    }
+
+    for event in page {
+        println!(
+            "[{}] {} | {} | {}",
+            event.ts_epoch_s,
+            event.kind,
+            event.severity,
+            explain_event(event)
+        );
+    }
+
+    Ok(())
+}
+
 pub fn render_journal_explain_markdown(events: &[JournalEvent]) -> String {
     let mut lines = vec!["# journal explain".to_string(), String::new()];
 
@@ -109,8 +155,14 @@ pub fn explain_event(event: &JournalEvent) -> String {
             event.reason.as_deref().unwrap_or("none"),
             event.result.as_deref().unwrap_or("none")
         ),
-        "goal_start" | "goal_complete" | "goal_abort" | "goal_create" => format!(
+        "goal_start" | "goal_complete" | "goal_abort" | "goal_create" | "goal_delete" => format!(
             "goal lifecycle; summary='{}'; action={}; result={}",
+            event.summary,
+            event.action.as_deref().unwrap_or("none"),
+            event.result.as_deref().unwrap_or("none")
+        ),
+        "goal_tag_add" | "goal_tag_remove" => format!(
+            "goal tag changed; summary='{}'; action={}; result={}",
             event.summary,
             event.action.as_deref().unwrap_or("none"),
             event.result.as_deref().unwrap_or("none")
@@ -235,6 +287,7 @@ mod tests {
             status: "doing".to_string(),
             hold_reason: None,
             notes: Vec::new(),
+            tags: Vec::new(),
             priority: 1,
             created_at_epoch_s: 1,
             updated_at_epoch_s: 1,
@@ -286,5 +339,96 @@ mod tests {
         assert!(event_mentions_goal(&by_title, &goal));
         assert!(event_mentions_goal(&by_id, &goal));
         assert!(!event_mentions_goal(&other, &goal));
+    }
+
+    fn make_event(kind: &str, severity: &str, ts: u64) -> JournalEvent {
+        JournalEvent {
+            event_id: format!("e-{ts}"),
+            ts_epoch_s: ts,
+            organism_id: "o1".to_string(),
+            runtime_habitat: "host".to_string(),
+            runtime_instance_id: "r1".to_string(),
+            kind: kind.to_string(),
+            severity: severity.to_string(),
+            summary: format!("{kind} at {ts}"),
+            reason: None,
+            action: None,
+            result: None,
+            continuity_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn search_journal_filters_by_kind() {
+        let events = vec![
+            make_event("goal_create", "notice", 100),
+            make_event("worker_heartbeat", "info", 200),
+            make_event("goal_create", "notice", 300),
+        ];
+        let filtered: Vec<&JournalEvent> = events.iter()
+            .filter(|e| e.kind == "goal_create")
+            .collect();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].ts_epoch_s, 100);
+        assert_eq!(filtered[1].ts_epoch_s, 300);
+    }
+
+    #[test]
+    fn search_journal_filters_by_severity() {
+        let events = vec![
+            make_event("goal_create", "notice", 100),
+            make_event("goal_hold", "warn", 200),
+            make_event("goal_note", "info", 300),
+        ];
+        let filtered: Vec<&JournalEvent> = events.iter()
+            .filter(|e| e.severity == "warn")
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].kind, "goal_hold");
+    }
+
+    #[test]
+    fn search_journal_filters_by_time_range() {
+        let events = vec![
+            make_event("goal_create", "notice", 100),
+            make_event("goal_create", "notice", 200),
+            make_event("goal_create", "notice", 300),
+        ];
+        let filtered: Vec<&JournalEvent> = events.iter()
+            .filter(|e| e.ts_epoch_s >= 150 && e.ts_epoch_s <= 250)
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ts_epoch_s, 200);
+    }
+
+    #[test]
+    fn search_journal_limits_count() {
+        let events: Vec<JournalEvent> = (0..10).map(|i| make_event("shutdown", "info", i)).collect();
+        let count = 3;
+        let start = events.len().saturating_sub(count);
+        let page: Vec<&JournalEvent> = events[start..].iter().collect();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].ts_epoch_s, 7);
+    }
+
+    #[test]
+    fn explain_event_formats_goal_delete() {
+        let event = make_event("goal_delete", "notice", 1);
+        let text = explain_event(&event);
+        assert!(text.contains("goal lifecycle"));
+    }
+
+    #[test]
+    fn explain_event_formats_goal_tag_add() {
+        let event = make_event("goal_tag_add", "info", 1);
+        let text = explain_event(&event);
+        assert!(text.contains("goal tag changed"));
+    }
+
+    #[test]
+    fn explain_event_formats_goal_tag_remove() {
+        let event = make_event("goal_tag_remove", "info", 1);
+        let text = explain_event(&event);
+        assert!(text.contains("goal tag changed"));
     }
 }

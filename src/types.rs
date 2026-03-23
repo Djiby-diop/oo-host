@@ -111,6 +111,8 @@ pub struct WorkerState {
     pub status: String,
     pub last_heartbeat_epoch_s: u64,
     pub heartbeat_count: u64,
+    #[serde(default)]
+    pub stale_after_s: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,6 +124,8 @@ pub struct Goal {
     pub hold_reason: Option<String>,
     #[serde(default)]
     pub notes: Vec<GoalNote>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub priority: i32,
     pub created_at_epoch_s: u64,
     pub updated_at_epoch_s: u64,

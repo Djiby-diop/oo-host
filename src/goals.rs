@@ -19,6 +19,7 @@ pub fn add_goal(
         status: "pending".to_string(),
         hold_reason: None,
         notes: Vec::new(),
+        tags: Vec::new(),
         priority,
         created_at_epoch_s: now,
         updated_at_epoch_s: now,
@@ -304,6 +305,116 @@ pub fn abort_goal(
     Ok(())
 }
 
+pub fn delete_goal(ctx: &mut RuntimeCtx, goal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let idx = ctx
+        .state
+        .goals
+        .iter()
+        .position(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    if !is_terminal_goal_status(&ctx.state.goals[idx].status) {
+        return Err(format!("goal is not terminal: {goal_id}").into());
+    }
+
+    let title = ctx.state.goals[idx].title.clone();
+    ctx.state.goals.remove(idx);
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_delete".to_string(),
+            severity: "notice".to_string(),
+            summary: format!("goal deleted: {title}"),
+            reason: None,
+            action: Some("goal_delete".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
+pub fn tag_goal(ctx: &mut RuntimeCtx, goal_id: &str, tag: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    if !goal.tags.contains(&tag.to_string()) {
+        goal.tags.push(tag.to_string());
+    }
+    let title = goal.title.clone();
+    goal.updated_at_epoch_s = now;
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_tag_add".to_string(),
+            severity: "info".to_string(),
+            summary: format!("goal tag added: {title} ({tag})"),
+            reason: None,
+            action: Some("goal_tag_add".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
+pub fn untag_goal(ctx: &mut RuntimeCtx, goal_id: &str, tag: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let now = now_epoch_s();
+    let goal = ctx
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.goal_id == goal_id)
+        .ok_or_else(|| format!("goal not found: {goal_id}"))?;
+
+    goal.tags.retain(|t| t != tag);
+    let title = goal.title.clone();
+    goal.updated_at_epoch_s = now;
+    persist_ctx(ctx)?;
+
+    append_event(
+        &ctx.paths.journal_path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now,
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "goal_tag_remove".to_string(),
+            severity: "info".to_string(),
+            summary: format!("goal tag removed: {title} ({tag})"),
+            reason: None,
+            action: Some("goal_tag_remove".to_string()),
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    Ok(())
+}
+
 pub fn list_goals(ctx: &RuntimeCtx) {
     if ctx.state.goals.is_empty() {
         println!("No goals.");
@@ -311,14 +422,20 @@ pub fn list_goals(ctx: &RuntimeCtx) {
     }
 
     for goal in &ctx.state.goals {
+        let tags_str = if goal.tags.is_empty() {
+            "none".to_string()
+        } else {
+            goal.tags.join(",")
+        };
         println!(
-            "{} | {} | prio={} | {} | hold={} | notes={} | {}",
+            "{} | {} | prio={} | {} | hold={} | notes={} | tags={} | {}",
             goal.goal_id,
             goal.status,
             goal.priority,
             goal.origin,
             goal.hold_reason.as_deref().unwrap_or("none"),
             goal.notes.len(),
+            tags_str,
             goal.title
         );
     }
@@ -372,6 +489,11 @@ pub fn inspect_goal(
 }
 
 pub fn render_goal_inspect_text(goal: &Goal, related_events: &[JournalEvent]) -> String {
+    let tags_str = if goal.tags.is_empty() {
+        "none".to_string()
+    } else {
+        goal.tags.join(", ")
+    };
     let mut lines = vec![
         format!("goal_id       : {}", goal.goal_id),
         format!("title         : {}", goal.title),
@@ -380,6 +502,7 @@ pub fn render_goal_inspect_text(goal: &Goal, related_events: &[JournalEvent]) ->
         format!("priority      : {}", goal.priority),
         format!("origin        : {}", goal.origin),
         format!("safety_class  : {}", goal.safety_class),
+        format!("tags          : {}", tags_str),
         format!("created_at    : {}", goal.created_at_epoch_s),
         format!("updated_at    : {}", goal.updated_at_epoch_s),
         format!("note_count    : {}", goal.notes.len()),
@@ -412,6 +535,11 @@ pub fn render_goal_inspect_text(goal: &Goal, related_events: &[JournalEvent]) ->
 }
 
 pub fn render_goal_inspect_markdown(goal: &Goal, related_events: &[JournalEvent]) -> String {
+    let tags_str = if goal.tags.is_empty() {
+        "none".to_string()
+    } else {
+        goal.tags.join(", ")
+    };
     let mut lines = vec![
         format!("# goal {}", goal.goal_id),
         String::new(),
@@ -421,6 +549,7 @@ pub fn render_goal_inspect_markdown(goal: &Goal, related_events: &[JournalEvent]
         format!("- priority: {}", goal.priority),
         format!("- origin: {}", goal.origin),
         format!("- safety_class: {}", goal.safety_class),
+        format!("- tags: {}", tags_str),
         format!("- created_at: {}", goal.created_at_epoch_s),
         format!("- updated_at: {}", goal.updated_at_epoch_s),
         format!("- note_count: {}", goal.notes.len()),
@@ -527,6 +656,7 @@ mod tests {
             status: status.to_string(),
             hold_reason: None,
             notes: Vec::new(),
+            tags: Vec::new(),
             priority,
             created_at_epoch_s,
             updated_at_epoch_s: created_at_epoch_s,
@@ -663,5 +793,67 @@ mod tests {
         assert!(text.contains("note_count    : 1"));
         assert!(text.contains("important context"));
         assert!(text.contains("recent_events :"));
+    }
+
+    #[test]
+    fn delete_goal_removes_terminal_goal() {
+        let g = goal("g1", "done goal", "done", 1, 1);
+        let mut state = sample_state(vec![g, goal("g2", "active", "doing", 1, 2)]);
+        assert_eq!(state.goals.len(), 2);
+        let idx = state.goals.iter().position(|g| g.goal_id == "g1").unwrap();
+        assert!(is_terminal_goal_status(&state.goals[idx].status));
+        state.goals.remove(idx);
+        assert_eq!(state.goals.len(), 1);
+        assert_eq!(state.goals[0].goal_id, "g2");
+    }
+
+    #[test]
+    fn delete_goal_rejects_non_terminal_goal() {
+        let g = goal("g1", "active", "doing", 1, 1);
+        assert!(!is_terminal_goal_status(&g.status));
+    }
+
+    #[test]
+    fn tag_goal_adds_tag_to_goal() {
+        let mut g = goal("g1", "tagged", "doing", 1, 1);
+        assert!(g.tags.is_empty());
+        if !g.tags.contains(&"v1".to_string()) {
+            g.tags.push("v1".to_string());
+        }
+        assert_eq!(g.tags, vec!["v1"]);
+    }
+
+    #[test]
+    fn tag_goal_is_idempotent() {
+        let mut g = goal("g1", "tagged", "doing", 1, 1);
+        g.tags.push("v1".to_string());
+        // Adding same tag again should not duplicate
+        if !g.tags.contains(&"v1".to_string()) {
+            g.tags.push("v1".to_string());
+        }
+        assert_eq!(g.tags.len(), 1);
+    }
+
+    #[test]
+    fn untag_goal_removes_tag_from_goal() {
+        let mut g = goal("g1", "tagged", "doing", 1, 1);
+        g.tags.push("v1".to_string());
+        g.tags.push("v2".to_string());
+        g.tags.retain(|t| t != "v1");
+        assert_eq!(g.tags, vec!["v2"]);
+    }
+
+    #[test]
+    fn list_goals_output_includes_tags_field() {
+        let mut g = goal("g1", "my goal", "pending", 1, 1);
+        g.tags.push("important".to_string());
+        let tags_str = if g.tags.is_empty() { "none".to_string() } else { g.tags.join(",") };
+        let line = format!(
+            "{} | {} | prio={} | {} | hold={} | notes={} | tags={} | {}",
+            g.goal_id, g.status, g.priority, g.origin,
+            g.hold_reason.as_deref().unwrap_or("none"),
+            g.notes.len(), tags_str, g.title
+        );
+        assert!(line.contains("tags=important"));
     }
 }
