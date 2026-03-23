@@ -1,6 +1,7 @@
 # oo-host
 
 Minimal host-side runtime skeleton for the Operating Organism.
+For the broader vision, see @OO_VISION.md.
 
 ## v0 goals
 
