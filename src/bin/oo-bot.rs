@@ -183,6 +183,12 @@ enum Command {
 		#[arg(long)]
 		receipt: Option<PathBuf>,
 	},
+	Diff {
+		snapshot_a: PathBuf,
+		snapshot_b: PathBuf,
+		#[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+		format: OutputFormat,
+	},
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -321,6 +327,30 @@ struct SovereignExport {
 	continuity_epoch: u64,
 	mode: String,
 	last_recovery_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiffableExport {
+	organism_id: String,
+	continuity_epoch: u64,
+	mode: String,
+	boot_or_start_count: u64,
+	active_goal_count: usize,
+	policy: DiffablePolicy,
+	top_goals: Vec<DiffableGoal>,
+	recent_events: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiffablePolicy {
+	enforcement: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiffableGoal {
+	goal_id: String,
+	title: String,
+	status: String,
 }
 
 #[derive(Debug)]
@@ -582,6 +612,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			if !ok {
 				std::process::exit(2);
 			}
+		}
+		Command::Diff { snapshot_a, snapshot_b, format } => {
+			let a: DiffableExport = read_json(&snapshot_a)?;
+			let b: DiffableExport = read_json(&snapshot_b)?;
+			print!("{}", diff_exports(&a, &b, format));
 		}
 	}
 
@@ -2666,6 +2701,89 @@ fn now_epoch_s() -> u64 {
 		.unwrap_or(0)
 }
 
+fn diff_exports(a: &DiffableExport, b: &DiffableExport, format: OutputFormat) -> String {
+	let id_match = if a.organism_id == b.organism_id { "match" } else { "MISMATCH" };
+	let continuity_delta = b.continuity_epoch as i64 - a.continuity_epoch as i64;
+	let boot_delta = b.boot_or_start_count as i64 - a.boot_or_start_count as i64;
+	let goal_delta = b.active_goal_count as i64 - a.active_goal_count as i64;
+
+	// Compute goal changes
+	let mut added: Vec<&DiffableGoal> = Vec::new();
+	let mut removed: Vec<&DiffableGoal> = Vec::new();
+	let mut changed: Vec<(&DiffableGoal, &DiffableGoal)> = Vec::new();
+
+	for bg in &b.top_goals {
+		match a.top_goals.iter().find(|ag| ag.goal_id == bg.goal_id) {
+			None => added.push(bg),
+			Some(ag) => {
+				if ag.status != bg.status {
+					changed.push((ag, bg));
+				}
+			}
+		}
+	}
+	for ag in &a.top_goals {
+		if b.top_goals.iter().all(|bg| bg.goal_id != ag.goal_id) {
+			removed.push(ag);
+		}
+	}
+
+	match format {
+		OutputFormat::Text => {
+			let mut out = String::new();
+			let _ = writeln!(out, "=== oo-bot diff ===");
+			let _ = writeln!(out, "organism_id    : {}  [{}]", b.organism_id, id_match);
+			let _ = writeln!(out, "continuity     : {} -> {}  (delta={})", a.continuity_epoch, b.continuity_epoch, continuity_delta);
+			let _ = writeln!(out, "mode           : {} -> {}", a.mode, b.mode);
+			let _ = writeln!(out, "policy         : {} -> {}", a.policy.enforcement, b.policy.enforcement);
+			let _ = writeln!(out, "boot_count     : {} -> {}  (delta={})", a.boot_or_start_count, b.boot_or_start_count, boot_delta);
+			let _ = writeln!(out, "active_goals   : {} -> {}  (delta={})", a.active_goal_count, b.active_goal_count, goal_delta);
+			let _ = writeln!(out);
+			let _ = writeln!(out, "--- goal changes ---");
+			for g in &added {
+				let _ = writeln!(out, "+ added:   {} | {} | {}", g.goal_id, g.status, g.title);
+			}
+			for g in &removed {
+				let _ = writeln!(out, "- removed: {} | {} | {}", g.goal_id, g.status, g.title);
+			}
+			for (old, new) in &changed {
+				let _ = writeln!(out, "~ changed: {} | {} -> {} | {}", old.goal_id, old.status, new.status, new.title);
+			}
+			let _ = writeln!(out);
+			let _ = writeln!(out, "--- events ---");
+			let _ = writeln!(out, "snapshot_a: {} events", a.recent_events.len());
+			let _ = writeln!(out, "snapshot_b: {} events", b.recent_events.len());
+			out
+		}
+		OutputFormat::Markdown => {
+			let mut out = String::new();
+			let _ = writeln!(out, "## Snapshot Diff");
+			let _ = writeln!(out);
+			let _ = writeln!(out, "| field | snapshot_a | snapshot_b |");
+			let _ = writeln!(out, "|---|---|---|");
+			let _ = writeln!(out, "| organism_id | `{}` | `{}` [{}] |", a.organism_id, b.organism_id, id_match);
+			let _ = writeln!(out, "| continuity_epoch | `{}` | `{}` (delta={}) |", a.continuity_epoch, b.continuity_epoch, continuity_delta);
+			let _ = writeln!(out, "| mode | `{}` | `{}` |", a.mode, b.mode);
+			let _ = writeln!(out, "| policy.enforcement | `{}` | `{}` |", a.policy.enforcement, b.policy.enforcement);
+			let _ = writeln!(out, "| boot_or_start_count | `{}` | `{}` (delta={}) |", a.boot_or_start_count, b.boot_or_start_count, boot_delta);
+			let _ = writeln!(out, "| active_goal_count | `{}` | `{}` (delta={}) |", a.active_goal_count, b.active_goal_count, goal_delta);
+			let _ = writeln!(out, "| recent_events | {} | {} |", a.recent_events.len(), b.recent_events.len());
+			let _ = writeln!(out);
+			let _ = writeln!(out, "### Goal Changes");
+			for g in &added {
+				let _ = writeln!(out, "- ➕ added: `{}` | {} | {}", g.goal_id, g.status, g.title);
+			}
+			for g in &removed {
+				let _ = writeln!(out, "- ➖ removed: `{}` | {} | {}", g.goal_id, g.status, g.title);
+			}
+			for (old, new) in &changed {
+				let _ = writeln!(out, "- 🔄 changed: `{}` | {} → {} | {}", old.goal_id, old.status, new.status, new.title);
+			}
+			out
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2838,5 +2956,75 @@ mod tests {
 		assert!(rendered.contains("## Handoff Status"));
 		assert!(rendered.contains("ready"));
 		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn diff_exports_text_shows_changes() {
+		let a = DiffableExport {
+			organism_id: "org-001".to_string(),
+			continuity_epoch: 2,
+			mode: "normal".to_string(),
+			boot_or_start_count: 3,
+			active_goal_count: 2,
+			policy: DiffablePolicy { enforcement: "observe".to_string() },
+			top_goals: vec![
+				DiffableGoal { goal_id: "g1".to_string(), title: "first goal".to_string(), status: "pending".to_string() },
+				DiffableGoal { goal_id: "g2".to_string(), title: "old goal".to_string(), status: "doing".to_string() },
+			],
+			recent_events: vec![serde_json::json!({"kind":"startup"})],
+		};
+		let b = DiffableExport {
+			organism_id: "org-001".to_string(),
+			continuity_epoch: 5,
+			mode: "degraded".to_string(),
+			boot_or_start_count: 6,
+			active_goal_count: 3,
+			policy: DiffablePolicy { enforcement: "enforce".to_string() },
+			top_goals: vec![
+				DiffableGoal { goal_id: "g1".to_string(), title: "first goal".to_string(), status: "doing".to_string() },
+				DiffableGoal { goal_id: "g3".to_string(), title: "new goal".to_string(), status: "pending".to_string() },
+			],
+			recent_events: vec![serde_json::json!({"kind":"startup"}), serde_json::json!({"kind":"tick"})],
+		};
+
+		let out = diff_exports(&a, &b, OutputFormat::Text);
+		assert!(out.contains("=== oo-bot diff ==="), "missing header");
+		assert!(out.contains("[match]"), "organism_id should match");
+		assert!(out.contains("delta=3"), "continuity delta");
+		assert!(out.contains("normal -> degraded"), "mode change");
+		assert!(out.contains("observe -> enforce"), "policy change");
+		assert!(out.contains("+ added:   g3"), "added goal");
+		assert!(out.contains("- removed: g2"), "removed goal");
+		assert!(out.contains("~ changed: g1"), "changed goal status");
+		assert!(out.contains("snapshot_a: 1 events"), "event count a");
+		assert!(out.contains("snapshot_b: 2 events"), "event count b");
+	}
+
+	#[test]
+	fn diff_exports_markdown_produces_table() {
+		let a = DiffableExport {
+			organism_id: "org-001".to_string(),
+			continuity_epoch: 0,
+			mode: "normal".to_string(),
+			boot_or_start_count: 1,
+			active_goal_count: 0,
+			policy: DiffablePolicy { enforcement: "off".to_string() },
+			top_goals: vec![],
+			recent_events: vec![],
+		};
+		let b = DiffableExport {
+			organism_id: "org-001".to_string(),
+			continuity_epoch: 1,
+			mode: "normal".to_string(),
+			boot_or_start_count: 2,
+			active_goal_count: 1,
+			policy: DiffablePolicy { enforcement: "observe".to_string() },
+			top_goals: vec![DiffableGoal { goal_id: "g1".to_string(), title: "new".to_string(), status: "pending".to_string() }],
+			recent_events: vec![],
+		};
+		let out = diff_exports(&a, &b, OutputFormat::Markdown);
+		assert!(out.contains("## Snapshot Diff"), "missing header");
+		assert!(out.contains("| field |"), "missing table header");
+		assert!(out.contains("➕ added"), "missing added goal marker");
 	}
 }

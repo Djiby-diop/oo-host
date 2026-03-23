@@ -19,7 +19,7 @@ use goals::{
     mark_goal_done, print_next_goal, resume_goal, start_goal, tag_goal, untag_goal,
 };
 use io::{append_event, now_epoch_s};
-use journal::{explain_journal, search_journal, tail_journal};
+use journal::{explain_journal, rotate_journal, search_journal, tail_journal};
 use policy::{print_mode, print_policy, set_mode, set_policy_enforcement};
 use reports::{print_status, write_daily_reports};
 use scheduler::scheduler_tick;
@@ -168,6 +168,12 @@ enum JournalSubcommand {
         until: Option<u64>,
         #[arg(short = 'n', long, default_value_t = 50)]
         count: usize,
+    },
+    Rotate {
+        #[arg(long, default_value_t = 10000)]
+        max_lines: usize,
+        #[arg(long, default_value_t = 2000)]
+        keep: usize,
     },
 }
 
@@ -333,6 +339,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     until,
                     count,
                 )?;
+            }
+            JournalSubcommand::Rotate { max_lines, keep } => {
+                rotate_journal(&ctx, max_lines, keep)?;
             }
         },
         Command::Report(report) => match report.command {

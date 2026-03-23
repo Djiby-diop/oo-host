@@ -1,8 +1,9 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use crate::types::{Goal, JournalEvent};
-use crate::io::{read_recent_events, read_all_events};
+use uuid::Uuid;
+use crate::types::{Goal, JournalEvent, RuntimeCtx};
+use crate::io::{read_recent_events, read_all_events, append_event, now_epoch_s};
 
 pub fn tail_journal(path: &Path, count: usize) -> Result<(), Box<dyn std::error::Error>> {
     if !path.exists() {
@@ -208,6 +209,68 @@ pub fn event_mentions_goal(event: &JournalEvent, goal: &Goal) -> bool {
         || reason.contains(&goal.goal_id)
         || reason.contains(&goal.title)
         || action.contains(&goal.goal_id)
+}
+
+pub fn rotate_journal(
+    ctx: &RuntimeCtx,
+    max_lines: usize,
+    keep: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = &ctx.paths.journal_path;
+
+    if !path.exists() {
+        println!("OK: journal within limit (0 lines), no rotation needed");
+        return Ok(());
+    }
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+    let total = lines.len();
+
+    if total < max_lines {
+        println!("OK: journal within limit ({total} lines), no rotation needed");
+        return Ok(());
+    }
+
+    let ts = now_epoch_s();
+    let archive_name = format!("organism_journal_{ts}.jsonl");
+    let archive_path = path.parent().unwrap_or(Path::new(".")).join(&archive_name);
+
+    fs::copy(path, &archive_path)?;
+
+    let kept_lines = if keep >= total { &lines[..] } else { &lines[total - keep..] };
+    let kept = kept_lines.len();
+    {
+        let mut out = File::create(path)?;
+        for line in kept_lines {
+            out.write_all(line.as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+    }
+
+    append_event(
+        path,
+        &JournalEvent {
+            event_id: Uuid::new_v4().to_string(),
+            ts_epoch_s: now_epoch_s(),
+            organism_id: ctx.identity.organism_id.clone(),
+            runtime_habitat: ctx.identity.runtime_habitat.clone(),
+            runtime_instance_id: ctx.runtime_instance_id.clone(),
+            kind: "journal_rotate".to_string(),
+            severity: "info".to_string(),
+            summary: format!(
+                "journal rotated: {total} lines archived to {archive_name}, {kept} lines kept"
+            ),
+            reason: None,
+            action: None,
+            result: Some("ok".to_string()),
+            continuity_epoch: ctx.state.continuity_epoch,
+        },
+    )?;
+
+    println!("OK: journal rotated — {total} lines archived, {kept} kept");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -430,5 +493,79 @@ mod tests {
         let event = make_event("goal_tag_remove", "info", 1);
         let text = explain_event(&event);
         assert!(text.contains("goal tag changed"));
+    }
+
+    #[test]
+    fn rotate_journal_archives_and_keeps_recent_lines() {
+        use crate::types::{
+            AppPaths, Identity, PolicyEnforcement, PolicyState, RuntimeCtx, RuntimeMode, State,
+        };
+        use std::io::Write as _;
+        use std::fs;
+        use uuid::Uuid;
+
+        let dir = std::env::temp_dir().join(format!("oo-host-rotate-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let journal_path = dir.join("organism_journal.jsonl");
+
+        // Write 15 dummy lines
+        let mut f = fs::File::create(&journal_path).unwrap();
+        for i in 0..15 {
+            writeln!(f, r#"{{"event_id":"e{i}","ts_epoch_s":{i},"organism_id":"o1","runtime_habitat":"host","runtime_instance_id":"r1","kind":"startup","severity":"info","summary":"line {i}","reason":null,"action":null,"result":null,"continuity_epoch":0}}"#).unwrap();
+        }
+        drop(f);
+
+        let paths = AppPaths::new(dir.clone());
+        let ctx = RuntimeCtx {
+            paths,
+            identity: Identity {
+                organism_id: "o1".to_string(),
+                genesis_id: "g1".to_string(),
+                runtime_habitat: "host".to_string(),
+                created_at_epoch_s: 0,
+            },
+            state: State {
+                boot_or_start_count: 1,
+                continuity_epoch: 0,
+                last_clean_shutdown: true,
+                last_recovery_reason: None,
+                last_started_at_epoch_s: 0,
+                mode: RuntimeMode::Normal,
+                policy: PolicyState {
+                    safe_first: true,
+                    deny_by_default: true,
+                    llm_advisory_only: true,
+                    enforcement: PolicyEnforcement::Observe,
+                },
+                workers: vec![],
+                goals: vec![],
+            },
+            runtime_instance_id: "r1".to_string(),
+        };
+
+        rotate_journal(&ctx, 10, 5).unwrap();
+
+        // Active journal should have at most keep+1 lines (5 kept + rotation event)
+        let active_content = fs::read_to_string(&journal_path).unwrap();
+        let active_lines: Vec<&str> = active_content.lines().filter(|l| !l.is_empty()).collect();
+        assert!(active_lines.len() <= 6, "expected ≤6 lines, got {}", active_lines.len());
+
+        // Archive should exist
+        let archives: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("organism_journal_") && name.ends_with(".jsonl")
+            })
+            .collect();
+        assert_eq!(archives.len(), 1, "expected 1 archive file");
+
+        let archive_content = fs::read_to_string(archives[0].path()).unwrap();
+        let archive_lines: Vec<&str> = archive_content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(archive_lines.len(), 15, "archive should have all 15 original lines");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
