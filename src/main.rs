@@ -1,30 +1,38 @@
+mod dream;
 mod export;
 mod federation;
 mod goals;
 mod io;
 mod journal;
+mod memory;
+mod narrate;
 mod policy;
 mod reports;
 mod scheduler;
 mod serve;
 mod signing;
 mod state;
+mod training;
 mod types;
+mod vitals;
 mod workers;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use export::export_sovereign;
+use dream::run_dream;
 use federation::{import_peer_export, list_peers, register_peer};
 use goals::{
     abort_goal, add_goal, add_goal_note, delegate_goal, delete_goal, hold_goal, inspect_goal,
     list_goals, mark_goal_done, print_next_goal, recall_goal, resume_goal, start_goal, tag_goal,
     untag_goal,
 };
-use io::{append_event, now_epoch_s};
+use io::{append_event, compute_fingerprint, now_epoch_s};
 use journal::{explain_journal, rotate_journal, search_journal, tail_journal};
+use memory::{consolidate_journal, list_memories};
+use narrate::narrate;
 use policy::{print_mode, print_policy, set_mode, set_policy_enforcement};
 use reports::{print_status, write_daily_reports};
 use scheduler::scheduler_tick;
@@ -32,6 +40,8 @@ use serve::run_server;
 use signing::{sign_event, verify_event};
 use state::{bootstrap, recover_state, save_recovery_snapshot, save_state};
 use types::{JournalEvent, OutputFormat, PolicyEnforcement, RuntimeMode};
+use training::{export_training, ingest_sovereign_training, locate_sovereign_train, print_training_summary};
+use vitals::print_vitals;
 use workers::{beat_worker, list_workers, run_worker_watchdog};
 
 #[derive(Parser, Debug)]
@@ -60,6 +70,12 @@ enum Command {
     Export(ExportCommand),
     Federation(FederationCommand),
     Serve(ServeCommand),
+    Dream(DreamCommand),
+    Vitals(VitalsCommand),
+    Fingerprint(FingerprintCommand),
+    Memory(MemoryCommand),
+    Narrate(NarrateCommand),
+    Training(TrainingCommand),
 }
 
 #[derive(Args, Debug)]
@@ -319,6 +335,83 @@ struct ServeCommand {
     bind: String,
 }
 
+#[derive(Args, Debug)]
+struct DreamCommand {
+    #[arg(long, default_value_t = 50)]
+    depth: usize,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct VitalsCommand {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+struct FingerprintCommand {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Args, Debug)]
+struct MemoryCommand {
+    #[command(subcommand)]
+    command: MemorySubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum MemorySubcommand {
+    Consolidate {
+        #[arg(long, default_value_t = 3600)]
+        window_s: u64,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+    List,
+}
+
+#[derive(Args, Debug)]
+struct NarrateCommand {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct TrainingCommand {
+    #[command(subcommand)]
+    command: TrainingSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum TrainingSubcommand {
+    /// Show stats about the firmware's OO_TRAIN.JSONL artifact.
+    Summary {
+        /// Path to OO_TRAIN.JSONL (firmware EFI volume or mounted path).
+        #[arg(long)]
+        sovereign: Option<PathBuf>,
+    },
+    /// Export high-quality samples to a clean JSONL file for SFT.
+    Export {
+        #[arg(long)]
+        sovereign: Option<PathBuf>,
+        /// Minimum quality score (0-10) to include.
+        #[arg(long, default_value_t = 6)]
+        min_quality: u8,
+        /// Output path for the exported JSONL.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Ingest new firmware samples into the host training dataset.
+    Ingest {
+        #[arg(long)]
+        sovereign: Option<PathBuf>,
+    },
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mut ctx = bootstrap(cli.data_dir)?;
@@ -535,6 +628,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_server(ctx, &serve.bind, serve.port)?;
             return Ok(());
         }
+        Command::Dream(dream) => {
+            run_dream(&ctx, dream.depth, dream.out.as_deref())?;
+        }
+        Command::Vitals(vitals) => {
+            print_vitals(&ctx, vitals.format);
+        }
+        Command::Fingerprint(fp) => {
+            let result = compute_fingerprint(&ctx.paths.journal_path)?;
+            if fp.format.is_markdown() {
+                println!("# continuity fingerprint\n");
+                println!("organism_id    : {}", ctx.identity.organism_id);
+                println!("fingerprint    : {}", result.fingerprint);
+                println!("event_count    : {}", result.event_count);
+                println!("first_event    : {}", result.first_event_ts.unwrap_or(0));
+                println!("last_event     : {}", result.last_event_ts.unwrap_or(0));
+                println!("span_s         : {}", result.span_s);
+            } else {
+                println!("=== continuity fingerprint ===");
+                println!("organism_id    : {}", ctx.identity.organism_id);
+                println!("fingerprint    : {}", result.fingerprint);
+                println!("event_count    : {}", result.event_count);
+                println!("first_event    : {}", result.first_event_ts.unwrap_or(0));
+                println!("last_event     : {}", result.last_event_ts.unwrap_or(0));
+                println!("span_s         : {}", result.span_s);
+            }
+        }
+        Command::Memory(mem) => match mem.command {
+            MemorySubcommand::Consolidate { window_s, out_dir } => {
+                let target = out_dir.unwrap_or_else(|| ctx.paths.data_dir.clone());
+                let n = consolidate_journal(&ctx, window_s, &target)?;
+                println!("OK: consolidated {n} memories");
+            }
+            MemorySubcommand::List => {
+                let memories_path = ctx.paths.data_dir.join("organism_memories.jsonl");
+                list_memories(&memories_path)?;
+            }
+        },
+        Command::Narrate(nar) => {
+            narrate(&ctx, nar.format, nar.out.as_deref())?;
+        }
+        Command::Training(tr) => match tr.command {
+            TrainingSubcommand::Summary { sovereign } => {
+                let base = sovereign
+                    .unwrap_or_else(|| ctx.paths.data_dir.join("sovereign"));
+                let src = locate_sovereign_train(&base)
+                    .or_else(|| {
+                        // Fallback: directly use the data_dir for local testing
+                        let p = base.with_extension("jsonl");
+                        if p.exists() { Some(p) } else { None }
+                    })
+                    .ok_or("OO_TRAIN.JSONL not found — use --sovereign <efi_vol_path>")?;
+                print_training_summary(&src)?;
+            }
+            TrainingSubcommand::Export { sovereign, min_quality, out } => {
+                let base = sovereign
+                    .unwrap_or_else(|| ctx.paths.data_dir.join("sovereign"));
+                let src = locate_sovereign_train(&base)
+                    .ok_or("OO_TRAIN.JSONL not found")?;
+                let out_path = out.unwrap_or_else(|| {
+                    ctx.paths.data_dir.join("oo_train_export.jsonl")
+                });
+                let n = export_training(&src, &out_path, min_quality)?;
+                println!("OK: exported {n} samples (quality >= {min_quality}) to {}", out_path.display());
+            }
+            TrainingSubcommand::Ingest { sovereign } => {
+                let base = sovereign
+                    .unwrap_or_else(|| ctx.paths.data_dir.join("sovereign"));
+                let src = locate_sovereign_train(&base)
+                    .ok_or("OO_TRAIN.JSONL not found")?;
+                let n = ingest_sovereign_training(&src, &ctx.paths.data_dir)?;
+                if n > 0 {
+                    println!("OK: ingested {n} new training samples from sovereign");
+                } else {
+                    println!("OK: no new samples (already up to date)");
+                }
+            }
+        },
     }
 
     ctx.state.last_clean_shutdown = true;

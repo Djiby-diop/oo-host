@@ -153,6 +153,14 @@ difficult to repudiate in a dispute.
 - [x] Cryptographically signed journal entries
 - [x] Web dashboard for real-time organism status
 
+### v2-extended — Cognitive runtime
+
+- [x] Dream cycles (`oo-host dream`) — idle introspection pass; replays journal, detects patterns, generates hypothetical futures as a timestamped report
+- [x] Organism vitals (`oo-host vitals`) — composite health score (0–100) from biological-inspired signals: mode, workers, goals, policy, shutdown quality, continuity, federation
+- [x] Continuity fingerprint (`oo-host fingerprint`) — rolling SHA-256 hash over all journal event IDs; cryptographic DNA that evolves deterministically with every event
+- [x] Memory consolidation (`oo-host memory consolidate`) — groups journal events into time-window memory entries stored in `organism_memories.jsonl`; models episodic-to-long-term memory consolidation
+- [x] Self-narration (`oo-host narrate`) — first-person prose autobiography generated deterministically from state and journal; no LLM required
+
 ## Relationship to `llm-baremetal`
 
 `oo-host` is the **host-side** of the Operating Organism.

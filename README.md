@@ -11,6 +11,56 @@ For the broader vision, see @OO_VISION.md.
 - goal management
 - deterministic operator CLI
 
+## v2 futuristic features
+
+These features give the organism biological, cognitive, and self-aware properties.
+
+### Dream cycles
+
+```
+cargo run -- dream [--depth <n>] [--out <file>]
+```
+
+When the organism is idle, it enters a "dream" — a synthetic introspection pass that replays the journal, detects patterns, and generates hypothetical future scenarios. The dream is stored as a timestamped markdown report.
+
+- `--depth` (default 50): how many journal events to analyse
+- `--out`: optional file to write the dream report to
+
+### Organism vitals
+
+```
+cargo run -- vitals [--format text|markdown]
+```
+
+Computes a composite health score (0–100) from biological-inspired signals: runtime mode, worker health, goal momentum, policy posture, last shutdown quality, continuity epoch, and federation status. Outputs a pulse rating: `strong` (≥70), `weak` (≥40), or `critical` (<40).
+
+### Continuity fingerprint
+
+```
+cargo run -- fingerprint [--format text|markdown]
+```
+
+A unique cryptographic DNA of the organism's entire history — a rolling SHA-256 hash over all journal event IDs in order. Two organisms with the same history always produce the same fingerprint.
+
+### Memory consolidation
+
+```
+cargo run -- memory consolidate [--window-s <n>] [--out-dir <dir>]
+cargo run -- memory list
+```
+
+The organism consolidates its journal into higher-level "memory entries" representing meaningful time periods. Like sleep consolidating episodic memory into long-term memory. Memories are stored in `data/organism_memories.jsonl`.
+
+- `--window-s` (default 3600): group events within this time window into one memory
+
+### Self-narration
+
+```
+cargo run -- narrate [--format text|markdown] [--out <file>]
+```
+
+The organism tells its own story in first-person prose, generated deterministically from its state and journal. Not LLM-generated — purely algorithmic narrative from structured data.
+
 ## Commands
 
 - `cargo run -- status`
