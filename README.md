@@ -1,3 +1,6 @@
+# oo-host — Operating Organism Host Runtime
+
+[![oo-host CI](https://github.com/Djiby-diop/oo-host/actions/workflows/oo-host-ci.yml/badge.svg)](https://github.com/Djiby-diop/oo-host/actions/workflows/oo-host-ci.yml)
 # oo-host
 
 Minimal host-side runtime skeleton for the Operating Organism.
